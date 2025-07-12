@@ -986,20 +986,46 @@ join_worker_node() {
     log_header "加入 Worker 节点"
     
     echo "加入集群的方式："
-    echo "1) 手动输入加入命令"
-    echo "2) 从文件读取加入命令"
-    echo "3) 输入 Master 信息生成加入命令"
+    echo "1) 从 Master 节点自动获取（推荐）"
+    echo "2) 手动输入加入命令 Master 节点：kubeadm token create --print-join-command"
+    echo "3) 从文件读取加入命令"
+    echo "4) 输入 Master 信息生成加入命令"
     echo
     
     read -p "请选择方式 (1-3): " join_method
     
     case $join_method in
         1)
+            read -p "请输入 Master 节点 IP: " master_ip
+            if [ -z "$master_ip" ]; then
+                log_error "Master IP 不能为空"
+                return 1
+            fi
+            
+            log_info "连接到 Master 节点获取加入命令..."
+            if command -v ssh >/dev/null 2>&1; then
+                SMART_JOIN_COMMAND=$(ssh -o ConnectTimeout=10 -o StrictHostKeyChecking=no root@$master_ip "kubeadm token create --print-join-command" 2>/dev/null)
+                if [ $? -eq 0 ] && [ ! -z "$SMART_JOIN_COMMAND" ]; then
+                    log_success "成功获取加入命令"
+                    echo "命令: $SMART_JOIN_COMMAND"
+                    return 0
+                else
+                    log_error "自动获取失败，请在 Master 节点手动执行："
+                    echo "  kubeadm token create --print-join-command"
+                    echo "然后选择选项2手动输入"
+                    return 1
+                fi
+            else
+                log_error "未安装 SSH 客户端"
+                return 1
+            fi
+            ;;
+        2)
             echo "请输入完整的加入命令："
             echo "格式: kubeadm join <master-ip>:6443 --token <token> --discovery-token-ca-cert-hash sha256:<hash>"
             read -p "加入命令: " join_command
             ;;
-        2)
+        3)
             read -p "请输入包含加入命令的文件路径: " command_file
             if [ -f "$command_file" ]; then
                 join_command=$(cat "$command_file")
@@ -1008,7 +1034,7 @@ join_worker_node() {
                 exit 1
             fi
             ;;
-        3)
+        4)
             read -p "请输入 Master 节点 IP: " master_ip
             read -p "请输入 Token: " token
             read -p "请输入 CA 证书哈希 (sha256:xxx): " ca_hash
