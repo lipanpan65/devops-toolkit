@@ -60,6 +60,7 @@ show_banner() {
     echo "  ✓ 容器运行时配置"
     echo "  ✓ 镜像源配置"
     echo "  ✓ 问题自动修复"
+    echo "  ✓ 节点清理重新加入"
     echo "=================================================="
     echo
 }
@@ -345,36 +346,161 @@ install_container_runtime() {
     log_header "安装容器运行时"
     
     echo "选择容器运行时："
-    echo "1) containerd (推荐)"
-    echo "2) Docker + containerd"
+    echo "1) containerd (推荐，Kubernetes 原生支持)"
+    echo "2) Docker (官方脚本安装，功能完整)"
     echo
     
     read -p "请选择容器运行时 (1-2): " runtime_choice
     
-    if [ "$runtime_choice" = "2" ]; then
-        INSTALL_DOCKER=true
-    else
-        INSTALL_DOCKER=false
-    fi
+    case $runtime_choice in
+        1)
+            INSTALL_DOCKER=false
+            INSTALL_METHOD="containerd"
+            ;;
+        2)
+            INSTALL_DOCKER=true
+            INSTALL_METHOD="official_script"
+            ;;
+        *)
+            log_warning "无效选择，使用默认选项 containerd"
+            INSTALL_DOCKER=false
+            INSTALL_METHOD="containerd"
+            ;;
+    esac
     
+    log_info "选择的安装方式: $INSTALL_METHOD"
+    
+    # 安装基础依赖
     if [ "$OS" = "centos" ]; then
-        # CentOS 安装
         log_step "安装容器运行时依赖"
         yum install -y yum-utils device-mapper-persistent-data lvm2
+    else
+        log_step "安装容器运行时依赖"
+        apt-get update
+        apt-get install -y apt-transport-https ca-certificates curl gnupg lsb-release
+    fi
+    
+    # 根据选择的方法安装
+    case $INSTALL_METHOD in
+        "official_script")
+            install_docker_official_script
+            ;;
+        "containerd")
+            install_containerd_only
+            ;;
+    esac
+    
+    log_success "容器运行时安装完成"
+}
+
+# 使用 Docker 官方脚本安装
+install_docker_official_script() {
+    log_step "使用 Docker 官方脚本安装"
+    
+    # 下载官方安装脚本
+    log_info "下载 Docker 官方安装脚本..."
+    if curl -fsSL https://get.docker.com -o get-docker.sh; then
+        log_success "脚本下载成功"
+    else
+        log_error "脚本下载失败，请检查网络连接"
+        exit 1
+    fi
+    
+    # 检查脚本文件
+    if [ ! -f get-docker.sh ] || [ ! -s get-docker.sh ]; then
+        log_error "安装脚本无效"
+        rm -f get-docker.sh
+        exit 1
+    fi
+    
+    # 执行安装脚本
+    log_info "执行 Docker 官方安装脚本（这可能需要几分钟）..."
+    if sh get-docker.sh; then
+        log_success "Docker 官方脚本安装成功"
+        rm -f get-docker.sh
         
-        if [ "$INSTALL_DOCKER" = "true" ]; then
-            log_step "安装 Docker"
-            yum-config-manager --add-repo https://mirrors.aliyun.com/docker-ce/linux/centos/docker-ce.repo
-            yum install -y docker-ce docker-ce-cli containerd.io
+        # 配置 Docker
+        configure_docker_daemon
+        
+        # 启动服务
+        systemctl enable docker
+        if systemctl start docker; then
+            log_success "Docker 服务启动成功"
+        else
+            log_error "Docker 服务启动失败"
+            log_info "查看错误信息："
+            systemctl status docker --no-pager -l
             
-            # 配置 Docker
-            mkdir -p /etc/docker
-            cat > /etc/docker/daemon.json << EOF
+            # 尝试修复
+            fix_docker_startup_issues
+        fi
+    else
+        log_error "Docker 官方脚本安装失败"
+        rm -f get-docker.sh
+        exit 1
+    fi
+}
+
+# 仅安装 containerd
+install_containerd_only() {
+    log_step "安装 containerd"
+    
+    if [ "$OS" = "centos" ]; then
+        # 添加 Docker 仓库（containerd 包含在其中）
+        if ! yum repolist | grep -q docker-ce; then
+            yum-config-manager --add-repo https://download.docker.com/linux/centos/docker-ce.repo
+            yum makecache fast
+        fi
+        
+        # 尝试多种方式安装 containerd
+        if yum list available containerd.io >/dev/null 2>&1; then
+            yum install -y containerd.io
+        elif yum list available containerd >/dev/null 2>&1; then
+            log_warning "使用系统自带的 containerd 包"
+            yum install -y containerd
+        else
+            log_error "无法找到 containerd 包，尝试手动安装"
+            # 手动下载安装
+            CONTAINERD_VERSION="1.6.33-3.1.el7"
+            CONTAINERD_URL="https://download.docker.com/linux/centos/7/x86_64/stable/Packages/containerd.io-${CONTAINERD_VERSION}.x86_64.rpm"
+            
+            log_info "下载 containerd RPM 包..."
+            if wget -O /tmp/containerd.io.rpm "$CONTAINERD_URL"; then
+                log_info "安装 containerd RPM 包..."
+                yum localinstall -y /tmp/containerd.io.rpm
+                rm -f /tmp/containerd.io.rpm
+            else
+                log_error "containerd 安装失败"
+                exit 1
+            fi
+        fi
+        
+    else
+        # Ubuntu 安装
+        if ! apt-cache search containerd.io | grep -q containerd.io; then
+            curl -fsSL https://download.docker.com/linux/ubuntu/gpg | gpg --dearmor -o /usr/share/keyrings/docker-archive-keyring.gpg
+            echo "deb [arch=amd64 signed-by=/usr/share/keyrings/docker-archive-keyring.gpg] https://download.docker.com/linux/ubuntu $(lsb_release -cs) stable" > /etc/apt/sources.list.d/docker.list
+            apt-get update
+        fi
+        
+        apt-get install -y containerd.io
+    fi
+    
+    # 配置 containerd
+    configure_containerd
+    
+    # 启动 containerd
+    systemctl enable containerd
+    systemctl restart containerd
+}
+
+# 配置 Docker daemon
+configure_docker_daemon() {
+    log_step "配置 Docker daemon"
+    
+    mkdir -p /etc/docker
+    cat > /etc/docker/daemon.json << 'EOF'
 {
-  "registry-mirrors": [
-    "https://mirror.ccs.tencentyun.com",
-    "https://hub-mirror.c.163.com"
-  ],
   "exec-opts": ["native.cgroupdriver=systemd"],
   "log-driver": "json-file",
   "log-opts": {
@@ -382,72 +508,275 @@ install_container_runtime() {
     "max-file": "3"
   },
   "storage-driver": "overlay2",
-  "storage-opts": [
-    "overlay2.override_kernel_check=true"
-  ]
+  "live-restore": true
 }
 EOF
-            systemctl enable docker
-            systemctl start docker
-        else
-            log_step "安装 containerd"
-            yum install -y containerd.io
-        fi
-        
-    else
-        # Ubuntu 安装
-        log_step "安装容器运行时依赖"
-        apt-get update
-        apt-get install -y apt-transport-https ca-certificates curl gnupg lsb-release
-        
-        if [ "$INSTALL_DOCKER" = "true" ]; then
-            log_step "安装 Docker"
-            curl -fsSL https://mirrors.aliyun.com/docker-ce/linux/ubuntu/gpg | gpg --dearmor -o /usr/share/keyrings/docker-archive-keyring.gpg
-            echo "deb [arch=amd64 signed-by=/usr/share/keyrings/docker-archive-keyring.gpg] https://mirrors.aliyun.com/docker-ce/linux/ubuntu $(lsb_release -cs) stable" > /etc/apt/sources.list.d/docker.list
-            
-            apt-get update
-            apt-get install -y docker-ce docker-ce-cli containerd.io
-            
-            # 配置 Docker (同上)
-            mkdir -p /etc/docker
-            cat > /etc/docker/daemon.json << EOF
-{
-  "registry-mirrors": [
-    "https://mirror.ccs.tencentyun.com",
-    "https://hub-mirror.c.163.com"
-  ],
-  "exec-opts": ["native.cgroupdriver=systemd"],
-  "log-driver": "json-file",
-  "log-opts": {
-    "max-size": "100m",
-    "max-file": "3"
-  },
-  "storage-driver": "overlay2"
-}
-EOF
-            systemctl enable docker
-            systemctl start docker
-        else
-            log_step "安装 containerd"
-            apt-get install -y containerd.io
-        fi
-    fi
     
-    # 配置 containerd
+    log_success "Docker daemon 配置完成"
+}
+
+# 配置 containerd
+configure_containerd() {
     log_step "配置 containerd"
+    
     mkdir -p /etc/containerd
     containerd config default > /etc/containerd/config.toml
     
     # 修改 containerd 配置
     sed -i 's/SystemdCgroup = false/SystemdCgroup = true/' /etc/containerd/config.toml
     sed -i '/disabled_plugins/s/\["cri"\]/[]/' /etc/containerd/config.toml
-    sed -i 's|registry.k8s.io/pause|registry.aliyuncs.com/google_containers/pause|' /etc/containerd/config.toml
     
-    # 启动 containerd
-    systemctl enable containerd
-    systemctl restart containerd
+    # 配置镜像源（国外服务器可能不需要，但保留以防万一）
+    if grep -q "registry.k8s.io/pause" /etc/containerd/config.toml; then
+        sed -i 's|registry.k8s.io/pause|registry.k8s.io/pause|' /etc/containerd/config.toml
+    fi
     
-    log_success "容器运行时安装完成"
+    log_success "containerd 配置完成"
+}
+
+# 修复 Docker 启动问题
+fix_docker_startup_issues() {
+    log_step "尝试修复 Docker 启动问题"
+    
+    # 停止服务
+    systemctl stop docker containerd 2>/dev/null || true
+    
+    # 清理可能的问题文件
+    rm -f /var/lib/docker/daemon.pid 2>/dev/null || true
+    
+    # 检查存储驱动
+    if [ ! -d /var/lib/docker ]; then
+        mkdir -p /var/lib/docker
+    fi
+    
+    # 重新启动服务
+    systemctl start containerd
+    sleep 3
+    
+    if systemctl start docker; then
+        log_success "Docker 修复成功"
+    else
+        log_error "Docker 修复失败"
+        log_info "详细错误信息："
+        journalctl -u docker.service -n 10 --no-pager
+        
+        # 提供选择
+        echo
+        read -p "是否切换到仅使用 containerd？(y/N): " -n 1 -r
+        echo
+        if [[ $REPLY =~ ^[Yy]$ ]]; then
+            systemctl stop docker 2>/dev/null || true
+            systemctl disable docker 2>/dev/null || true
+            INSTALL_DOCKER=false
+            INSTALL_METHOD="containerd"
+            log_info "已切换到仅使用 containerd"
+        else
+            log_error "请手动解决 Docker 问题后重新运行脚本"
+            exit 1
+        fi
+    fi
+}
+
+# 验证容器运行时安装
+verify_container_runtime() {
+    log_step "验证容器运行时安装"
+    
+    # 验证 containerd
+    if systemctl is-active containerd >/dev/null 2>&1; then
+        log_success "containerd 运行正常"
+        if command -v crictl >/dev/null 2>&1; then
+            crictl version 2>/dev/null || log_warning "crictl 连接失败（正常现象，K8s 初始化后会正常）"
+        fi
+    else
+        log_error "containerd 未运行"
+        return 1
+    fi
+    
+    # 如果安装了 Docker，验证 Docker
+    if [ "$INSTALL_DOCKER" = "true" ] && systemctl is-enabled docker >/dev/null 2>&1; then
+        if systemctl is-active docker >/dev/null 2>&1; then
+            log_success "Docker 运行正常"
+            docker version --format '{{.Server.Version}}' 2>/dev/null || log_warning "Docker 版本获取失败"
+            
+            # 运行测试容器
+            log_info "测试 Docker 功能..."
+            if timeout 30s docker run --rm hello-world >/dev/null 2>&1; then
+                log_success "Docker 功能测试通过"
+            else
+                log_warning "Docker 功能测试失败，但基本功能可能正常"
+            fi
+        else
+            log_error "Docker 未运行"
+            return 1
+        fi
+    fi
+    
+    return 0
+}
+
+# 检测并处理混合容器运行时
+check_mixed_runtime_compatibility() {
+    log_step "检查容器运行时兼容性"
+    
+    # 检测当前节点的容器运行时
+    local current_runtime=""
+    if systemctl is-active docker >/dev/null 2>&1; then
+        current_runtime="docker"
+        log_info "当前节点运行时: Docker"
+    elif systemctl is-active containerd >/dev/null 2>&1; then
+        current_runtime="containerd"
+        log_info "当前节点运行时: containerd"
+    else
+        log_error "未检测到运行中的容器运行时"
+        return 1
+    fi
+    
+    # 如果是 Worker 节点，询问 Master 节点的运行时
+    if [ "$INSTALL_MODE" = "worker" ]; then
+        echo
+        echo "Master 节点使用的容器运行时："
+        echo "1) Docker"
+        echo "2) containerd"
+        echo "3) 不确定"
+        echo
+        read -p "请选择 Master 节点的运行时 (1-3): " master_runtime_choice
+        
+        case $master_runtime_choice in
+            1)
+                master_runtime="docker"
+                ;;
+            2)
+                master_runtime="containerd"
+                ;;
+            3)
+                log_info "将跳过运行时兼容性检查"
+                return 0
+                ;;
+            *)
+                log_warning "无效选择，跳过兼容性检查"
+                return 0
+                ;;
+        esac
+        
+        # 检查混合运行时情况
+        if [ "$current_runtime" != "$master_runtime" ]; then
+            log_warning "检测到混合容器运行时环境："
+            echo "  Master 节点: $master_runtime"
+            echo "  Worker 节点: $current_runtime"
+            echo
+            
+            echo "建议的处理方案："
+            echo "1) 继续使用混合运行时（需要确保配置兼容）"
+            echo "2) 切换当前节点运行时与 Master 保持一致"
+            echo "3) 忽略此检查"
+            echo
+            
+            read -p "请选择方案 (1-3): " compat_choice
+            
+            case $compat_choice in
+                1)
+                    log_info "继续使用混合运行时"
+                    ensure_compatible_config "$current_runtime"
+                    ;;
+                2)
+                    switch_container_runtime "$master_runtime"
+                    ;;
+                3)
+                    log_info "忽略兼容性检查"
+                    ;;
+                *)
+                    log_warning "无效选择，继续使用当前配置"
+                    ;;
+            esac
+        else
+            log_success "容器运行时一致，无需额外配置"
+        fi
+    fi
+}
+
+# 确保兼容的配置
+ensure_compatible_config() {
+    local runtime=$1
+    log_step "确保 $runtime 配置兼容"
+    
+    if [ "$runtime" = "docker" ]; then
+        # 确保 Docker 配置兼容
+        mkdir -p /etc/docker
+        cat > /etc/docker/daemon.json << 'EOF'
+{
+  "exec-opts": ["native.cgroupdriver=systemd"],
+  "storage-driver": "overlay2",
+  "log-driver": "json-file",
+  "log-opts": {
+    "max-size": "100m",
+    "max-file": "3"
+  },
+  "live-restore": true
+}
+EOF
+        systemctl restart docker
+        log_success "Docker 配置已优化"
+        
+    elif [ "$runtime" = "containerd" ]; then
+        # 确保 containerd 配置兼容
+        mkdir -p /etc/containerd
+        containerd config default > /etc/containerd/config.toml
+        
+        # 启用 SystemdCgroup
+        sed -i 's/SystemdCgroup = false/SystemdCgroup = true/' /etc/containerd/config.toml
+        
+        # 确保使用标准的 pause 镜像
+        sed -i 's|registry.k8s.io/pause|registry.k8s.io/pause|' /etc/containerd/config.toml
+        
+        systemctl restart containerd
+        log_success "containerd 配置已优化"
+    fi
+}
+
+# 切换容器运行时
+switch_container_runtime() {
+    local target_runtime=$1
+    log_step "切换到 $target_runtime 运行时"
+    
+    echo
+    log_warning "切换容器运行时需要重新安装，这将："
+    echo "  1. 停止当前容器运行时"
+    echo "  2. 安装目标运行时"
+    echo "  3. 重新配置 kubelet"
+    echo
+    
+    read -p "确认切换？(y/N): " -n 1 -r
+    echo
+    if [[ ! $REPLY =~ ^[Yy]$ ]]; then
+        log_info "取消切换"
+        return 0
+    fi
+    
+    if [ "$target_runtime" = "docker" ]; then
+        # 切换到 Docker
+        systemctl stop containerd
+        systemctl disable containerd
+        
+        # 安装 Docker
+        install_docker_official_script
+        
+    elif [ "$target_runtime" = "containerd" ]; then
+        # 切换到 containerd
+        systemctl stop docker
+        systemctl disable docker
+        
+        # 重新配置 containerd
+        install_containerd_only
+        
+        # 更新 kubelet 配置
+        if [ -f /var/lib/kubelet/kubeadm-flags.env ]; then
+            sed -i 's/--container-runtime=docker/--container-runtime=remote/' /var/lib/kubelet/kubeadm-flags.env
+            sed -i 's/--container-runtime-endpoint=.*/--container-runtime-endpoint=unix:\/\/\/var\/run\/containerd\/containerd.sock/' /var/lib/kubelet/kubeadm-flags.env
+        fi
+    fi
+    
+    systemctl restart kubelet
+    log_success "容器运行时切换完成"
 }
 
 # 安装 Kubernetes 组件
@@ -500,24 +829,87 @@ EOF
 initialize_master() {
     log_header "初始化 Master 节点"
     
+    # 确保主机名解析正确
+    log_step "检查主机名解析"
+    if ! ping -c 1 "$CURRENT_HOSTNAME" >/dev/null 2>&1; then
+        log_warning "主机名解析失败，添加到 /etc/hosts"
+        if ! grep -q "$CURRENT_HOSTNAME" /etc/hosts; then
+            echo "$CURRENT_IP $CURRENT_HOSTNAME" >> /etc/hosts
+        fi
+    fi
+    
+    # 等待 kubelet 就绪
+    log_step "等待 kubelet 服务就绪"
+    systemctl restart kubelet
+    sleep 10
+    
     log_step "预拉取镜像"
     kubeadm config images pull --image-repository=registry.aliyuncs.com/google_containers --kubernetes-version=$K8S_VERSION
     
     log_step "初始化集群"
-    kubeadm init \
-        --apiserver-advertise-address="$CURRENT_IP" \
-        --kubernetes-version="$K8S_VERSION" \
-        --pod-network-cidr="$POD_CIDR" \
-        --service-cidr="$SERVICE_CIDR" \
-        --image-repository=registry.aliyuncs.com/google_containers \
-        --node-name="$CURRENT_HOSTNAME"
+    
+    # 创建 kubeadm 配置文件
+    cat > /tmp/kubeadm-config.yaml << EOF
+apiVersion: kubeadm.k8s.io/v1beta3
+kind: InitConfiguration
+localAPIEndpoint:
+  advertiseAddress: $CURRENT_IP
+  bindPort: 6443
+nodeRegistration:
+  name: $CURRENT_HOSTNAME
+  criSocket: unix:///var/run/containerd/containerd.sock
+---
+apiVersion: kubeadm.k8s.io/v1beta3
+kind: ClusterConfiguration
+kubernetesVersion: $K8S_VERSION
+imageRepository: registry.aliyuncs.com/google_containers
+clusterName: kubernetes
+networking:
+  podSubnet: $POD_CIDR
+  serviceSubnet: $SERVICE_CIDR
+apiServer:
+  advertiseAddress: $CURRENT_IP
+controllerManager: {}
+scheduler: {}
+etcd:
+  local:
+    dataDir: /var/lib/etcd
+---
+apiVersion: kubelet.config.k8s.io/v1beta1
+kind: KubeletConfiguration
+cgroupDriver: systemd
+containerRuntimeEndpoint: unix:///var/run/containerd/containerd.sock
+EOF
+    
+    # 使用配置文件初始化
+    kubeadm init --config=/tmp/kubeadm-config.yaml --ignore-preflight-errors=NumCPU,Mem
     
     if [ $? -eq 0 ]; then
         log_success "集群初始化成功"
     else
         log_error "集群初始化失败"
-        exit 1
+        log_info "尝试使用更详细的错误信息重新初始化..."
+        
+        # 如果失败，尝试基本命令
+        kubeadm init \
+            --apiserver-advertise-address="$CURRENT_IP" \
+            --kubernetes-version="$K8S_VERSION" \
+            --pod-network-cidr="$POD_CIDR" \
+            --service-cidr="$SERVICE_CIDR" \
+            --image-repository=registry.aliyuncs.com/google_containers \
+            --node-name="$CURRENT_HOSTNAME" \
+            --cri-socket=unix:///var/run/containerd/containerd.sock \
+            --ignore-preflight-errors=NumCPU,Mem \
+            --v=5
+        
+        if [ $? -ne 0 ]; then
+            log_error "集群初始化最终失败"
+            exit 1
+        fi
     fi
+    
+    # 清理临时文件
+    rm -f /tmp/kubeadm-config.yaml
     
     # 配置 kubectl
     log_step "配置 kubectl"
@@ -526,9 +918,23 @@ initialize_master() {
     chown $(id -u):$(id -g) $HOME/.kube/config
     
     # 生成加入命令
-    log_step "生成节点加入命令"
-    JOIN_COMMAND=$(kubeadm token create --print-join-command)
-    echo "$JOIN_COMMAND" > /tmp/k8s-join-command.txt
+    log_step "生成 Worker 节点加入命令"
+    if JOIN_COMMAND=$(kubeadm token create --print-join-command 2>/dev/null); then
+        echo "$JOIN_COMMAND" > /tmp/k8s-join-command.txt
+        log_success "加入命令已生成并保存到 /tmp/k8s-join-command.txt"
+        
+        echo
+        echo "=============================================="
+        echo "         Worker 节点加入命令"
+        echo "=============================================="
+        echo "$JOIN_COMMAND"
+        echo "=============================================="
+        echo
+        log_info "请将上述命令复制到 Worker 节点执行，或使用脚本自动获取"
+    else
+        log_warning "自动生成加入命令失败，可手动生成："
+        echo "  kubeadm token create --print-join-command"
+    fi
     
     log_success "Master 节点初始化完成"
     
@@ -670,25 +1076,78 @@ verify_installation() {
     
     # 检查组件版本
     log_step "检查组件版本"
-    kubectl version --client --short 2>/dev/null || echo "kubectl: 未配置"
-    kubeadm version --short
-    kubelet --version
+    if kubectl version --client >/dev/null 2>&1; then
+        kubectl version --client --output=yaml | grep gitVersion || echo "kubectl: $(kubectl version --client --short 2>/dev/null || echo '未正确配置')"
+    else
+        echo "kubectl: 未配置或无法连接到集群"
+    fi
+    
+    echo "kubeadm: $(kubeadm version --output=short 2>/dev/null || kubeadm version 2>/dev/null | grep 'kubeadm version' || echo '版本获取失败')"
+    echo "kubelet: $(kubelet --version 2>/dev/null || echo '版本获取失败')"
     
     if [ "$INSTALL_MODE" = "master" ] || [ "$INSTALL_MODE" = "single" ]; then
+        # 等待节点就绪
+        log_step "等待节点就绪（最多等待2分钟）"
+        for i in {1..24}; do
+            if kubectl get nodes 2>/dev/null | grep -q "Ready"; then
+                break
+            fi
+            echo -n "."
+            sleep 5
+        done
+        echo
+        
         # 检查节点状态
         log_step "检查节点状态"
-        kubectl get nodes -o wide
+        kubectl get nodes -o wide 2>/dev/null || {
+            log_warning "kubectl 未正确配置，尝试修复..."
+            if [ -f /etc/kubernetes/admin.conf ]; then
+                mkdir -p $HOME/.kube
+                cp -i /etc/kubernetes/admin.conf $HOME/.kube/config
+                chown $(id -u):$(id -g) $HOME/.kube/config
+                log_info "kubectl 配置已修复，重新检查..."
+                kubectl get nodes -o wide
+            else
+                log_error "无法找到 admin.conf 文件"
+            fi
+        }
         
         # 检查系统 Pod
-        log_step "检查系统 Pod"
-        kubectl get pods --all-namespaces
+        log_step "检查系统 Pod 状态"
+        kubectl get pods --all-namespaces 2>/dev/null || log_warning "无法获取 Pod 状态"
+        
+        # 等待所有 Pod 就绪
+        log_step "等待系统 Pod 就绪（最多等待3分钟）"
+        for i in {1..36}; do
+            pending_pods=$(kubectl get pods --all-namespaces --no-headers 2>/dev/null | grep -E "(Pending|ContainerCreating|Init)" | wc -l)
+            if [ "$pending_pods" -eq 0 ]; then
+                log_success "所有系统 Pod 已就绪"
+                break
+            fi
+            echo "等待 $pending_pods 个 Pod 启动... ($i/36)"
+            sleep 5
+        done
         
         # 创建测试 Pod
-        log_step "创建测试 Pod"
-        kubectl run test-pod --image=nginx:alpine --restart=Never
-        sleep 10
-        kubectl get pods -o wide
-        kubectl delete pod test-pod
+        log_step "创建测试 Pod 验证集群功能"
+        if kubectl run test-pod --image=nginx:alpine --restart=Never --dry-run=client -o yaml | kubectl apply -f - 2>/dev/null; then
+            log_info "等待测试 Pod 启动..."
+            sleep 15
+            
+            pod_status=$(kubectl get pod test-pod -o jsonpath='{.status.phase}' 2>/dev/null || echo "Unknown")
+            if [ "$pod_status" = "Running" ]; then
+                log_success "测试 Pod 运行正常"
+                kubectl get pod test-pod -o wide
+            else
+                log_warning "测试 Pod 状态: $pod_status"
+                kubectl describe pod test-pod 2>/dev/null || true
+            fi
+            
+            # 清理测试 Pod
+            kubectl delete pod test-pod 2>/dev/null || true
+        else
+            log_warning "无法创建测试 Pod，跳过测试"
+        fi
         
         log_success "验证完成"
         
@@ -699,10 +1158,26 @@ verify_installation() {
             echo "=============================================="
             cat /tmp/k8s-join-command.txt
             echo "=============================================="
+        else
+            echo
+            log_info "生成 Worker 节点加入命令："
+            join_cmd=$(kubeadm token create --print-join-command 2>/dev/null || echo "命令生成失败")
+            echo "=============================================="
+            echo "$join_cmd"
+            echo "=============================================="
+            echo "$join_cmd" > /tmp/k8s-join-command.txt
         fi
     else
         log_step "Worker 节点验证"
         log_info "请在 Master 节点上运行 'kubectl get nodes' 验证节点加入"
+        
+        # 检查 kubelet 状态
+        if systemctl is-active kubelet >/dev/null 2>&1; then
+            log_success "kubelet 服务运行正常"
+        else
+            log_warning "kubelet 服务状态异常"
+            systemctl status kubelet --no-pager
+        fi
     fi
 }
 
@@ -785,11 +1260,12 @@ show_main_menu() {
         echo "2) 快速安装 Worker 节点"
         echo "3) 自定义安装"
         echo "4) 修复现有安装"
-        echo "5) 卸载 Kubernetes"
+        echo "5) 节点清理重新加入"
+        echo "6) 卸载 Kubernetes"
         echo "0) 退出"
         echo
         
-        read -p "请选择操作 (0-5): " main_choice
+        read -p "请选择操作 (0-6): " main_choice
         
         case $main_choice in
             1)
@@ -809,6 +1285,10 @@ show_main_menu() {
                 break
                 ;;
             5)
+                cleanup_rejoin_workflow
+                break
+                ;;
+            6)
                 uninstall_kubernetes
                 break
                 ;;
@@ -901,6 +1381,13 @@ execute_installation() {
     check_system_requirements
     configure_system_environment
     install_container_runtime
+    
+    # 验证容器运行时
+    if ! verify_container_runtime; then
+        log_error "容器运行时验证失败"
+        exit 1
+    fi
+    
     install_kubernetes_components
     
     case $INSTALL_MODE in
@@ -909,6 +1396,8 @@ execute_installation() {
             install_network_plugin
             ;;
         "worker")
+            # 检查容器运行时兼容性
+            check_mixed_runtime_compatibility
             join_worker_node
             configure_worker_kubectl
             ;;
@@ -1062,25 +1551,481 @@ uninstall_kubernetes() {
     
     # 卸载组件
     if [ "$OS" = "centos" ]; then
-        yum remove -y kubelet kubeadm kubectl
+        yum remove -y kubelet kubeadm kubectl 2>/dev/null || true
     else
-        apt-get remove -y kubelet kubeadm kubectl
-        apt-mark unhold kubelet kubeadm kubectl
+        apt-get remove -y kubelet kubeadm kubectl 2>/dev/null || true
+        apt-mark unhold kubelet kubeadm kubectl 2>/dev/null || true
     fi
     
-    # 清理配置
+    # 清理配置文件
     rm -rf /etc/kubernetes/
     rm -rf ~/.kube/
     rm -rf /var/lib/kubelet/
     rm -rf /var/lib/etcd/
+    
+    # 清理 CNI 配置
     rm -rf /etc/cni/
     rm -rf /opt/cni/
     
-    # 清理网络
+    # 清理网络配置
+    log_step "清理网络配置"
+    iptables -F 2>/dev/null || true
+    iptables -t nat -F 2>/dev/null || true
+    iptables -t mangle -F 2>/dev/null || true
+    iptables -X 2>/dev/null || true
+    
+    # 清理 IPVS
+    ipvsadm --clear 2>/dev/null || true
+    
+    # 清理网络接口
     ip link delete cni0 2>/dev/null || true
     ip link delete flannel.1 2>/dev/null || true
+    ip link delete docker0 2>/dev/null || true
+    
+    # 清理容器运行时（可选）
+    echo
+    read -p "是否同时卸载容器运行时 (Docker/containerd)？(y/N): " -n 1 -r
+    echo
+    if [[ $REPLY =~ ^[Yy]$ ]]; then
+        log_step "卸载容器运行时"
+        
+        # 停止服务
+        systemctl stop docker 2>/dev/null || true
+        systemctl stop containerd 2>/dev/null || true
+        systemctl disable docker 2>/dev/null || true
+        systemctl disable containerd 2>/dev/null || true
+        
+        if [ "$OS" = "centos" ]; then
+            yum remove -y docker-ce docker-ce-cli containerd.io 2>/dev/null || true
+        else
+            apt-get remove -y docker-ce docker-ce-cli containerd.io 2>/dev/null || true
+        fi
+        
+        # 清理 Docker 数据
+        rm -rf /var/lib/docker/
+        rm -rf /var/lib/containerd/
+        rm -rf /etc/docker/
+        rm -rf /etc/containerd/
+    fi
+    
+    # 重启网络服务
+    log_step "重启网络服务"
+    if [ "$OS" = "centos" ]; then
+        systemctl restart network 2>/dev/null || systemctl restart NetworkManager 2>/dev/null || true
+    else
+        systemctl restart networking 2>/dev/null || systemctl restart NetworkManager 2>/dev/null || true
+    fi
     
     log_success "Kubernetes 卸载完成"
+    echo
+    log_info "清理内容："
+    echo "  ✓ Kubernetes 组件和配置"
+    echo "  ✓ etcd 数据"
+    echo "  ✓ CNI 网络配置"
+    echo "  ✓ iptables 规则"
+    echo "  ✓ 网络接口"
+    
+    if [[ $REPLY =~ ^[Yy]$ ]]; then
+        echo "  ✓ 容器运行时"
+    fi
+    
+    echo
+    log_info "建议重启系统以确保完全清理"
+}
+
+# 节点清理重新加入工作流
+cleanup_rejoin_workflow() {
+    log_header "节点清理重新加入"
+    
+    # 检测当前状态
+    if detect_node_config_status; then
+        # 需要清理
+        echo
+        echo "处理选项："
+        echo "1) 自动清理并重新加入（推荐）"
+        echo "2) 仅执行清理"
+        echo "3) 仅重新加入集群"
+        echo "4) 返回主菜单"
+        echo
+        
+        read -p "请选择操作 (1-4): " action_choice
+        
+        case $action_choice in
+            1)
+                # 自动清理并重新加入
+                echo
+                echo "清理方式："
+                echo "1) 完整清理（推荐，清理所有配置和网络）"
+                echo "2) 快速清理（仅清理必要配置）"
+                echo
+                read -p "请选择清理方式 (1-2): " cleanup_choice
+                
+                case $cleanup_choice in
+                    1)
+                        deep_cleanup_node
+                        ;;
+                    2)
+                        quick_cleanup_node
+                        ;;
+                    *)
+                        log_warning "无效选择，使用快速清理"
+                        quick_cleanup_node
+                        ;;
+                esac
+                
+                # 获取加入命令并执行
+                if smart_get_join_command; then
+                    smart_join_cluster
+                else
+                    log_error "获取加入命令失败"
+                fi
+                ;;
+            2)
+                # 仅执行清理
+                echo
+                echo "清理方式："
+                echo "1) 完整清理"
+                echo "2) 快速清理"
+                read -p "请选择 (1-2): " cleanup_choice
+                
+                if [ "$cleanup_choice" = "1" ]; then
+                    deep_cleanup_node
+                else
+                    quick_cleanup_node
+                fi
+                ;;
+            3)
+                # 仅重新加入集群
+                if smart_get_join_command; then
+                    smart_join_cluster
+                fi
+                ;;
+            4)
+                return 0
+                ;;
+            *)
+                log_error "无效选择"
+                return 1
+                ;;
+        esac
+    else
+        # 无需清理，直接加入
+        log_info "节点状态干净，可以直接加入集群"
+        echo
+        read -p "是否立即加入集群？(y/N): " -n 1 -r
+        echo
+        if [[ $REPLY =~ ^[Yy]$ ]]; then
+            if smart_get_join_command; then
+                smart_join_cluster
+            fi
+        fi
+    fi
+}
+
+# 检测节点配置状态
+detect_node_config_status() {
+    log_header "检测节点配置状态"
+    
+    echo "检查项目                          状态"
+    echo "=============================================="
+    
+    # 检查配置文件
+    if [ -f /etc/kubernetes/kubelet.conf ]; then
+        echo "kubelet.conf                      存在 ❌"
+        HAS_KUBELET_CONF=true
+    else
+        echo "kubelet.conf                      不存在 ✅"
+        HAS_KUBELET_CONF=false
+    fi
+    
+    if [ -f /etc/kubernetes/bootstrap-kubelet.conf ]; then
+        echo "bootstrap-kubelet.conf            存在 ❌"
+        HAS_BOOTSTRAP_CONF=true
+    else
+        echo "bootstrap-kubelet.conf            不存在 ✅"
+        HAS_BOOTSTRAP_CONF=false
+    fi
+    
+    if [ -f /etc/kubernetes/pki/ca.crt ]; then
+        echo "ca.crt                           存在 ❌"
+        HAS_CA_CERT=true
+    else
+        echo "ca.crt                           不存在 ✅"
+        HAS_CA_CERT=false
+    fi
+    
+    # 检查服务状态
+    if systemctl is-active kubelet >/dev/null 2>&1; then
+        echo "kubelet 服务                      运行中 ⚠️"
+        KUBELET_RUNNING=true
+    else
+        echo "kubelet 服务                      已停止 ✅"
+        KUBELET_RUNNING=false
+    fi
+    
+    # 检查端口占用
+    if netstat -tlnp 2>/dev/null | grep -q ":10250"; then
+        echo "端口 10250                       被占用 ❌"
+        PORT_OCCUPIED=true
+    else
+        echo "端口 10250                       空闲 ✅"
+        PORT_OCCUPIED=false
+    fi
+    
+    # 检查容器运行时
+    if systemctl is-active docker >/dev/null 2>&1; then
+        echo "Docker 服务                      运行中 ✅"
+        CONTAINER_RUNTIME="docker"
+    elif systemctl is-active containerd >/dev/null 2>&1; then
+        echo "containerd 服务                  运行中 ✅"
+        CONTAINER_RUNTIME="containerd"
+    else
+        echo "容器运行时                        未运行 ❌"
+        CONTAINER_RUNTIME="none"
+    fi
+    
+    # 检查网络接口
+    if ip link show cni0 >/dev/null 2>&1; then
+        echo "CNI 网络接口                     存在 ❌"
+        HAS_CNI_INTERFACE=true
+    else
+        echo "CNI 网络接口                     不存在 ✅"
+        HAS_CNI_INTERFACE=false
+    fi
+    
+    echo "=============================================="
+    
+    # 判断是否需要清理
+    if [ "$HAS_KUBELET_CONF" = true ] || [ "$HAS_BOOTSTRAP_CONF" = true ] || 
+       [ "$HAS_CA_CERT" = true ] || [ "$PORT_OCCUPIED" = true ] ||
+       [ "$HAS_CNI_INTERFACE" = true ]; then
+        NEEDS_CLEANUP=true
+        echo
+        log_warning "检测到需要清理的配置"
+        return 0
+    else
+        NEEDS_CLEANUP=false
+        echo
+        log_success "节点状态干净，可以直接加入集群"
+        return 1
+    fi
+}
+
+# 完整清理节点配置
+deep_cleanup_node() {
+    log_step "执行完整节点清理"
+    
+    # 1. 停止相关服务
+    log_info "停止相关服务..."
+    systemctl stop kubelet 2>/dev/null || true
+    
+    # 2. 重置 kubeadm
+    log_info "重置 kubeadm..."
+    kubeadm reset -f 2>/dev/null || true
+    
+    # 3. 清理配置文件
+    log_info "清理 Kubernetes 配置文件..."
+    rm -rf /etc/kubernetes/
+    rm -rf ~/.kube/
+    rm -rf /var/lib/kubelet/
+    rm -rf /var/lib/etcd/
+    
+    # 4. 清理 CNI 网络配置
+    log_info "清理 CNI 网络配置..."
+    rm -rf /etc/cni/net.d/
+    rm -rf /opt/cni/bin/
+    
+    # 5. 清理网络接口
+    log_info "清理网络接口..."
+    ip link delete cni0 2>/dev/null || true
+    ip link delete flannel.1 2>/dev/null || true
+    ip link delete kube-bridge 2>/dev/null || true
+    ip link delete docker0 2>/dev/null || true
+    
+    # 6. 清理 iptables 规则
+    log_info "清理 iptables 规则..."
+    iptables -F 2>/dev/null || true
+    iptables -t nat -F 2>/dev/null || true
+    iptables -t mangle -F 2>/dev/null || true
+    iptables -X 2>/dev/null || true
+    
+    # 7. 清理 IPVS 规则
+    log_info "清理 IPVS 规则..."
+    ipvsadm --clear 2>/dev/null || true
+    
+    # 8. 询问是否清理容器和镜像
+    echo
+    read -p "是否清理容器和镜像？(y/N): " -n 1 -r
+    echo
+    if [[ $REPLY =~ ^[Yy]$ ]]; then
+        log_info "清理容器和镜像..."
+        if [ "$CONTAINER_RUNTIME" = "docker" ]; then
+            docker system prune -af 2>/dev/null || true
+        elif [ "$CONTAINER_RUNTIME" = "containerd" ]; then
+            crictl rmi --prune 2>/dev/null || true
+            crictl rm -af 2>/dev/null || true
+        fi
+    fi
+    
+    # 9. 重启容器运行时和 kubelet
+    log_info "重启服务..."
+    if [ "$CONTAINER_RUNTIME" = "docker" ]; then
+        systemctl restart docker
+    elif [ "$CONTAINER_RUNTIME" = "containerd" ]; then
+        systemctl restart containerd
+    else
+        log_error "容器运行时未运行，请先启动容器运行时"
+        return 1
+    fi
+    
+    systemctl restart kubelet
+    sleep 5
+    
+    log_success "完整清理完成"
+}
+
+# 快速清理节点配置
+quick_cleanup_node() {
+    log_step "执行快速节点清理"
+    
+    # 停止服务
+    systemctl stop kubelet 2>/dev/null || true
+    
+    # 重置 kubeadm
+    kubeadm reset -f 2>/dev/null || true
+    
+    # 清理主要配置文件
+    rm -rf /etc/kubernetes/
+    rm -rf ~/.kube/
+    rm -rf /var/lib/kubelet/
+    
+    # 重启服务
+    if [ "$CONTAINER_RUNTIME" = "docker" ]; then
+        systemctl restart docker
+    elif [ "$CONTAINER_RUNTIME" = "containerd" ]; then
+        systemctl restart containerd
+    fi
+    
+    systemctl restart kubelet
+    sleep 3
+    
+    log_success "快速清理完成"
+}
+
+# 自动获取加入命令
+smart_get_join_command() {
+    log_step "获取集群加入命令"
+    
+    echo "获取加入命令的方式："
+    echo "1) 从 Master 节点自动获取（推荐）"
+    echo "2) 手动输入完整加入命令"
+    echo "3) 从文件读取"
+    echo "4) 手动组装加入命令"
+    echo
+    
+    read -p "请选择方式 (1-4): " method_choice
+    
+    case $method_choice in
+        1)
+            read -p "请输入 Master 节点 IP: " master_ip
+            if [ -z "$master_ip" ]; then
+                log_error "Master IP 不能为空"
+                return 1
+            fi
+            
+            log_info "连接到 Master 节点获取加入命令..."
+            if command -v ssh >/dev/null 2>&1; then
+                SMART_JOIN_COMMAND=$(ssh -o ConnectTimeout=10 -o StrictHostKeyChecking=no root@$master_ip "kubeadm token create --print-join-command" 2>/dev/null)
+                if [ $? -eq 0 ] && [ ! -z "$SMART_JOIN_COMMAND" ]; then
+                    log_success "成功获取加入命令"
+                    echo "命令: $SMART_JOIN_COMMAND"
+                    return 0
+                else
+                    log_error "自动获取失败，请在 Master 节点手动执行："
+                    echo "  kubeadm token create --print-join-command"
+                    echo "然后选择选项2手动输入"
+                    return 1
+                fi
+            else
+                log_error "未安装 SSH 客户端"
+                return 1
+            fi
+            ;;
+        2)
+            echo
+            echo "请输入完整的加入命令："
+            echo "格式: kubeadm join <master-ip>:6443 --token <token> --discovery-token-ca-cert-hash sha256:<hash>"
+            echo
+            read -p "加入命令: " SMART_JOIN_COMMAND
+            ;;
+        3)
+            read -p "请输入包含加入命令的文件路径: " command_file
+            if [ -f "$command_file" ]; then
+                SMART_JOIN_COMMAND=$(cat "$command_file")
+                log_info "从文件读取: $SMART_JOIN_COMMAND"
+            else
+                log_error "文件不存在: $command_file"
+                return 1
+            fi
+            ;;
+        4)
+            echo
+            read -p "Master 节点 IP: " master_ip
+            read -p "Token: " token
+            read -p "CA 证书哈希 (sha256:xxx): " ca_hash
+            SMART_JOIN_COMMAND="kubeadm join ${master_ip}:6443 --token ${token} --discovery-token-ca-cert-hash ${ca_hash} --node-name=${CURRENT_HOSTNAME}"
+            ;;
+        *)
+            log_error "无效选择"
+            return 1
+            ;;
+    esac
+    
+    if [ -z "$SMART_JOIN_COMMAND" ]; then
+        log_error "加入命令不能为空"
+        return 1
+    fi
+    
+    return 0
+}
+
+# 执行智能加入集群
+smart_join_cluster() {
+    log_step "加入 Kubernetes 集群"
+    
+    echo "执行加入命令:"
+    echo "$SMART_JOIN_COMMAND"
+    echo
+    
+    if eval "$SMART_JOIN_COMMAND"; then
+        log_success "节点成功加入集群！"
+        
+        # 验证加入结果
+        log_step "验证节点加入状态"
+        
+        # 等待 kubelet 启动
+        log_info "等待 kubelet 服务启动..."
+        sleep 15
+        
+        # 检查 kubelet 状态
+        if systemctl is-active kubelet >/dev/null 2>&1; then
+            log_success "kubelet 服务运行正常"
+        else
+            log_warning "kubelet 服务可能需要更长时间启动"
+        fi
+        
+        echo
+        log_info "请在 Master 节点运行以下命令验证："
+        echo "  kubectl get nodes"
+        echo "  kubectl get nodes -o wide"
+        echo
+        log_info "节点应该在几分钟内变为 Ready 状态"
+        
+        return 0
+    else
+        log_error "节点加入失败"
+        return 1
+    fi
 }
 
 # 主函数
