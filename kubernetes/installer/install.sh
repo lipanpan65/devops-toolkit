@@ -24,6 +24,7 @@ log_success() { echo -e "${GREEN}[SUCCESS]${NC} $1"; }
 log_warning() { echo -e "${YELLOW}[WARNING]${NC} $1"; }
 log_error() { echo -e "${RED}[ERROR]${NC} $1"; }
 log_step() { echo -e "${PURPLE}[STEP]${NC} $1"; }
+log_header() { echo -e "${CYAN}=== $1 ===${NC}"; }
 
 # 显示横幅
 show_banner() {
@@ -43,7 +44,8 @@ show_banner() {
 
 # 检查系统要求
 check_system() {
-    log_step "检查系统环境"
+    # log_step "检查系统环境"
+    log_header "检查系统环境"
     
     # 检查权限
     if [ "$EUID" -ne 0 ]; then
