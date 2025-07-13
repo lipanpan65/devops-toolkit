@@ -2,6 +2,19 @@
 # 支持本地虚拟机和云服务器
 # 简单易用，专注于学习
 
+# #!/bin/bash
+
+# # 获取项目根目录
+# SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
+
+# # 一次性加载所有工具
+# source "$PROJECT_ROOT/utils/load-utils.sh"
+
+# # 使用函数
+# log_info "开始安装..."
+
+
 set -e
 
 # 颜色定义
