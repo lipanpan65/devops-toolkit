@@ -273,25 +273,16 @@ setup_mysql_service() {
     fi
 }
 
-# 配置systemd服务（可选）
-setup_systemd_service() {
-    log_step "配置systemd服务"
+# 创建systemd服务文件
+create_systemd_service() {
+    log_step "创建systemd服务文件"
     
-    echo ""
-    echo -e "${YELLOW}是否创建systemd服务文件以便使用systemctl管理MySQL？${NC}"
-    echo "选择 y/Y 将创建systemd服务文件"
-    echo "选择 n/N 将跳过此步骤，继续使用传统的init.d脚本"
-    echo ""
-    read -p "请输入选择 (y/n): " choice
+    log_info "检测到systemd系统，正在创建MySQL systemd服务文件"
     
-    case "$choice" in
-        [Yy]*)
-            log_info "开始创建systemd服务文件"
-            
-            # 创建systemd服务文件
-            cat > /etc/systemd/system/mysqld.service <<EOF
+    # 创建systemd服务文件
+    cat > /etc/systemd/system/mysqld.service <<EOF
 [Unit]
-Description=MySQL Server
+Description=MySQL Community Server
 Documentation=man:mysqld(8)
 Documentation=http://dev.mysql.com/doc/refman/en/using-systemd.html
 After=network.target
@@ -303,44 +294,126 @@ WantedBy=multi-user.target
 [Service]
 User=$MYSQL_USER
 Group=$MYSQL_USER
+
+# 服务类型为forking，因为mysqld_safe会fork出mysqld进程
 Type=forking
-PIDFile=$MYSQL_DATA_DIR/mysqld.pid
-TimeoutSec=0
-PermissionsStartOnly=true
-ExecStartPre=/usr/local/mysql/bin/mysqld_safe_helper
-ExecStart=$MYSQL_BASE_DIR/bin/mysqld_safe --defaults-file=/etc/my.cnf --pid-file=$MYSQL_DATA_DIR/mysqld.pid
-TimeoutStartSec=0
+
+# PID文件路径
+PIDFile=$MYSQL_DATA_DIR/$(hostname).pid
+
+# 启动前的准备工作
+ExecStartPre=/usr/bin/mkdir -p $MYSQL_DATA_DIR
+ExecStartPre=/usr/bin/chown $MYSQL_USER:$MYSQL_USER $MYSQL_DATA_DIR
+
+# 启动命令 - 使用mysqld_safe启动
+ExecStart=$MYSQL_BASE_DIR/bin/mysqld_safe --defaults-file=/etc/my.cnf
+
+# 停止命令
+ExecStop=/bin/kill -TERM \$MAINPID
+
+# 重启策略
 Restart=on-failure
 RestartPreventExitStatus=1
+
+# 超时设置
+TimeoutStartSec=60
+TimeoutStopSec=60
+
+# 安全设置
 PrivateTmp=false
+PrivateNetwork=false
+PrivateDevices=false
+
+# 资源限制
+LimitNOFILE=65535
+
+# 工作目录
+WorkingDirectory=$MYSQL_BASE_DIR
 EOF
-            
-            # 重新加载systemd配置
-            systemctl daemon-reload
-            
-            # 尝试启用服务
-            log_info "尝试启用MySQL systemd服务"
-            if systemctl enable mysqld 2>/dev/null; then
-                log_info "systemd服务启用成功，可以使用以下命令管理MySQL："
-                echo "  启动: systemctl start mysqld"
-                echo "  停止: systemctl stop mysqld"
-                echo "  重启: systemctl restart mysqld"
-                echo "  状态: systemctl status mysqld"
-                return 0
-            else
-                log_warn "systemd启用失败，这是正常现象，系统将使用传统的chkconfig方式"
-                log_info "尝试使用chkconfig启用服务"
+
+    log_info "systemd服务文件创建完成"
+    
+    # 显示服务文件内容
+    echo ""
+    log_info "MySQL systemd服务文件内容："
+    echo "----------------------------------------"
+    cat /etc/systemd/system/mysqld.service
+    echo "----------------------------------------"
+    echo ""
+    
+    # 重新加载systemd配置
+    log_info "重新加载systemd配置"
+    systemctl daemon-reload
+    
+    log_info "systemd服务配置完成，3秒后继续..."
+    sleep 3
+}
+
+# 配置systemd服务（可选）
+setup_systemd_service() {
+    log_step "配置MySQL服务启动方式"
+    
+    # 检查系统是否支持systemd
+    if command -v systemctl >/dev/null 2>&1 && [[ -d /etc/systemd/system ]]; then
+        echo ""
+        echo -e "${YELLOW}检测到systemd系统，请选择MySQL服务管理方式：${NC}"
+        echo "1) 创建systemd服务文件 (推荐) - 使用systemctl管理"
+        echo "2) 仅使用传统init.d脚本 - 使用service命令管理"
+        echo "3) 两种方式都配置 - 最大兼容性"
+        echo ""
+        read -p "请输入选择 (1/2/3): " choice
+        
+        case "$choice" in
+            1)
+                log_info "选择创建systemd服务文件"
+                create_systemd_service
+                
+                # 尝试启用systemd服务
+                log_info "启用MySQL systemd服务"
+                if systemctl enable mysqld; then
+                    log_info "systemd服务启用成功！"
+                    echo ""
+                    echo -e "${GREEN}可以使用以下systemctl命令管理MySQL：${NC}"
+                    echo "  启动: systemctl start mysqld"
+                    echo "  停止: systemctl stop mysqld"
+                    echo "  重启: systemctl restart mysqld"
+                    echo "  状态: systemctl status mysqld"
+                    echo "  开机自启: systemctl enable mysqld"
+                else
+                    log_error "systemd服务启用失败"
+                    # 回退到chkconfig方式
+                    log_info "回退到chkconfig方式"
+                    /sbin/chkconfig mysqld on
+                fi
+                ;;
+            2)
+                log_info "选择仅使用传统init.d脚本"
                 /sbin/chkconfig mysqld on
                 log_info "已通过chkconfig启用MySQL服务"
-            fi
-            ;;
-        [Nn]*)
-            log_info "跳过systemd服务配置，继续使用传统init.d脚本"
-            ;;
-        *)
-            log_warn "无效选择，跳过systemd服务配置"
-            ;;
-    esac
+                ;;
+            3)
+                log_info "选择配置两种启动方式"
+                create_systemd_service
+                
+                # 先尝试systemd方式
+                if systemctl enable mysqld 2>/dev/null; then
+                    log_info "systemd服务启用成功"
+                else
+                    log_warn "systemd启用失败，使用chkconfig作为备选"
+                    /sbin/chkconfig mysqld on
+                fi
+                
+                log_info "两种启动方式都已配置完成"
+                ;;
+            *)
+                log_warn "无效选择，使用默认的chkconfig方式"
+                /sbin/chkconfig mysqld on
+                ;;
+        esac
+    else
+        log_info "未检测到systemd，使用传统的chkconfig方式"
+        /sbin/chkconfig mysqld on
+    fi
     
     echo ""
     log_info "服务配置完成，继续安装流程..."
@@ -357,8 +430,21 @@ start_mysql() {
         return 0
     fi
     
-    # 启动MySQL
-    /etc/init.d/mysqld start
+    # 检查是否存在systemd服务文件
+    if [[ -f /etc/systemd/system/mysqld.service ]] && command -v systemctl >/dev/null 2>&1; then
+        log_info "使用systemd方式启动MySQL服务"
+        
+        # 使用systemctl启动
+        if systemctl start mysqld; then
+            log_info "MySQL服务通过systemd启动成功"
+        else
+            log_warn "systemd启动失败，尝试传统方式启动"
+            /etc/init.d/mysqld start
+        fi
+    else
+        log_info "使用传统init.d方式启动MySQL服务"
+        /etc/init.d/mysqld start
+    fi
     
     # 等待MySQL启动完成
     local retry_count=0
@@ -367,6 +453,18 @@ start_mysql() {
     while [[ $retry_count -lt $max_retries ]]; do
         if "$MYSQL_BASE_DIR/bin/mysqladmin" ping -h localhost >/dev/null 2>&1; then
             log_info "MySQL服务启动成功"
+            
+            # 显示MySQL进程信息
+            echo ""
+            log_info "MySQL进程信息："
+            ps aux | grep -E '[m]ysql' | head -5
+            echo ""
+            
+            # 显示端口监听情况
+            log_info "MySQL端口监听情况："
+            netstat -tlnp 2>/dev/null | grep ":$MYSQL_PORT " || ss -tlnp | grep ":$MYSQL_PORT "
+            echo ""
+            
             return 0
         fi
         
@@ -375,7 +473,14 @@ start_mysql() {
         ((retry_count++))
     done
     
-    log_error "MySQL启动超时"
+    log_error "MySQL启动超时，请检查日志文件"
+    echo ""
+    echo "可以查看以下日志文件排查问题："
+    echo "  错误日志: $MYSQL_DATA_DIR/$(hostname).err"
+    echo "  系统日志: /var/log/messages"
+    if [[ -f /etc/systemd/system/mysqld.service ]]; then
+        echo "  systemd日志: journalctl -u mysqld"
+    fi
     exit 1
 }
 
@@ -397,18 +502,27 @@ security_reminder() {
     echo "   mysql_secure_installation"
     echo ""
     echo "3. MySQL服务管理命令："
-    if systemctl is-enabled mysqld &>/dev/null; then
-        echo "   (systemd方式)"
+    if [[ -f /etc/systemd/system/mysqld.service ]] && systemctl is-enabled mysqld &>/dev/null; then
+        echo -e "   ${GREEN}(推荐使用systemd方式)${NC}"
         echo "   启动: systemctl start mysqld"
         echo "   停止: systemctl stop mysqld"
         echo "   重启: systemctl restart mysqld"
         echo "   状态: systemctl status mysqld"
+        echo "   查看日志: journalctl -u mysqld"
         echo ""
-        echo "   或者使用传统方式:"
+        echo "   传统方式仍然可用:"
+        echo "   启动: /etc/init.d/mysqld start"
+        echo "   停止: /etc/init.d/mysqld stop"
+        echo "   重启: /etc/init.d/mysqld restart"
+    else
+        echo -e "   ${YELLOW}(使用传统init.d方式)${NC}"
+        echo "   启动: /etc/init.d/mysqld start"
+        echo "   启动: service mysqld start"
+        echo "   停止: /etc/init.d/mysqld stop"
+        echo "   停止: service mysqld stop"
+        echo "   重启: /etc/init.d/mysqld restart"
+        echo "   重启: service mysqld restart"
     fi
-    echo "   启动: /etc/init.d/mysqld start"
-    echo "   停止: /etc/init.d/mysqld stop"
-    echo "   重启: /etc/init.d/mysqld restart"
     echo ""
     echo "4. MySQL配置文件位置: /etc/my.cnf"
     echo "5. MySQL数据目录: $MYSQL_DATA_DIR"
