@@ -289,17 +289,37 @@ download_and_install_mysql() {
     
     if [[ -n "$existing_files" ]]; then
         log_info "发现现有的MySQL安装包:"
-        echo "$existing_files"
         echo ""
-        read -p "是否使用现有的安装包？(y/n): " use_existing
-        if [[ "$use_existing" =~ ^[Yy]$ ]]; then
-            # 从文件名中提取版本号
-            existing_file=$(echo "$existing_files" | head -1)
-            extracted_version=$(basename "$existing_file" | sed 's/mysql-\(.*\)-linux-glibc2.12-x86_64.tar.xz/\1/')
-            log_info "使用现有版本: $extracted_version"
-            MYSQL_VERSION="$extracted_version"
-            use_existing_file=true
+        
+        # 使用更兼容的方法将文件列表转为数组
+        declare -a existing_array
+        while IFS= read -r line; do
+            [[ -n "$line" ]] && existing_array+=("$line")
+        done <<< "$existing_files"
+        
+        if [[ ${#existing_array[@]} -gt 0 ]]; then
+            echo "=============== 现有安装包选择 ==============="
+            for i in "${!existing_array[@]}"; do
+                file="${existing_array[i]}"
+                version=$(basename "$file" | sed 's/mysql-\(.*\)-linux-glibc2.12-x86_64.tar.xz/\1/')
+                echo "$((i+1))) 使用现有的 MySQL $version"
+            done
+            echo "$((${#existing_array[@]}+1))) 不使用现有安装包，重新下载"
+            echo "=========================================="
+            echo ""
+            
+            read -p "请选择 (1-$((${#existing_array[@]}+1))): " existing_choice
+            
+            if [[ "$existing_choice" =~ ^[0-9]+$ ]] && [[ "$existing_choice" -ge 1 ]] && [[ "$existing_choice" -le "${#existing_array[@]}" ]]; then
+                # 选择了现有文件
+                existing_file="${existing_array[$((existing_choice-1))]}"
+                extracted_version=$(basename "$existing_file" | sed 's/mysql-\(.*\)-linux-glibc2.12-x86_64.tar.xz/\1/')
+                log_info "选择使用现有版本: $extracted_version"
+                MYSQL_VERSION="$extracted_version"
+                use_existing_file=true
+            fi
         fi
+        # 如果选择了最后一个选项或输入无效，则 use_existing_file 保持 false
     fi
     
     # 只有在不使用现有文件时才提示选择版本
