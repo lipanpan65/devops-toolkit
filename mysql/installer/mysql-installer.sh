@@ -745,6 +745,9 @@ start_mysql() {
     chown -R "$MYSQL_USER:$MYSQL_USER" "/data/${MYSQL_PORT}"
     
     # 启动MySQL (参考官方mysql.server)
+    # 切换到安全目录，避免权限问题
+    cd "$MYSQL_DATA_DIR" 2>/dev/null || cd /tmp
+    
     "$MYSQL_BASE_DIR/bin/mysqld_safe" \
         --defaults-file="$MYSQL_CONFIG_FILE" \
         --datadir="$MYSQL_DATA_DIR" \
@@ -1008,6 +1011,7 @@ create_manual_startup_script() {
 
 MYSQL_PORT="$MYSQL_PORT"
 MYSQL_BASE_DIR="$MYSQL_BASE_DIR"
+MYSQL_DATA_DIR="$MYSQL_DATA_DIR"
 MYSQL_CONFIG_FILE="$MYSQL_CONFIG_FILE"
 MYSQL_USER="$MYSQL_USER"
 MYSQL_SOCKET="$MYSQL_SOCKET"
@@ -1025,7 +1029,8 @@ case "\$1" in
         # 确保目录权限
         chown -R \$MYSQL_USER:\$MYSQL_USER /data/\${MYSQL_PORT}
         
-        # 启动MySQL
+        # 启动MySQL (切换到安全目录避免权限问题)
+        cd \$MYSQL_DATA_DIR 2>/dev/null || cd /tmp
         sudo -u \$MYSQL_USER \$MYSQL_BASE_DIR/bin/mysqld_safe --defaults-file=\$MYSQL_CONFIG_FILE --daemonize
         
         # 等待启动完成
@@ -1530,7 +1535,7 @@ troubleshoot_mysql_startup() {
     echo "   $MYSQL_BASE_DIR/bin/mysqld --initialize-insecure --user=mysql --basedir=$MYSQL_BASE_DIR --datadir=$MYSQL_DATA_DIR"
     echo ""
     echo "4. 手动启动测试："
-    echo "   sudo -u mysql $MYSQL_BASE_DIR/bin/mysqld_safe --defaults-file=$MYSQL_CONFIG_FILE &"
+    echo "   cd /data/$MYSQL_PORT/data && sudo -u mysql $MYSQL_BASE_DIR/bin/mysqld_safe --defaults-file=$MYSQL_CONFIG_FILE &"
     echo ""
     echo "5. 检查端口冲突："
     echo "   netstat -tlnp | grep $MYSQL_PORT"
@@ -1640,7 +1645,7 @@ security_reminder() {
     # 如果没有任何服务配置
     if [[ $service_count -eq 0 ]]; then
         echo -e "   ${RED}❌ 未配置任何启动服务${NC}"
-        echo "   手动启动: sudo -u mysql $MYSQL_BASE_DIR/bin/mysqld_safe --defaults-file=$MYSQL_CONFIG_FILE --daemonize"
+        echo "   手动启动: cd /data/$MYSQL_PORT/data && sudo -u mysql $MYSQL_BASE_DIR/bin/mysqld_safe --defaults-file=$MYSQL_CONFIG_FILE --daemonize"
         echo "   手动停止: $MYSQL_BASE_DIR/bin/mysqladmin -S $MYSQL_SOCKET shutdown"
     fi
     
@@ -1691,7 +1696,7 @@ security_reminder() {
     echo "   • Socket文件: ls -la $MYSQL_SOCKET"
     echo ""
     echo "5. 手动启动测试:"
-    echo "   sudo -u mysql $MYSQL_BASE_DIR/bin/mysqld_safe --defaults-file=$MYSQL_CONFIG_FILE --daemonize"
+    echo "   cd /data/$MYSQL_PORT/data && sudo -u mysql $MYSQL_BASE_DIR/bin/mysqld_safe --defaults-file=$MYSQL_CONFIG_FILE --daemonize"
     echo ""
     echo -e "${GREEN}✅ 测试连接${NC}"
     echo "----------------------------------------"
