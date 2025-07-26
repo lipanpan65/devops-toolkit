@@ -1,2078 +1,934 @@
 #!/bin/bash
 
-# Kubernetes 完整安装脚本
-# 支持 Master 和 Worker 节点安装，版本选择，自动处理各种配置问题
+# MySQL 8.0 多实例自动安装脚本
+# 支持 CentOS 7/8 和 RHEL 7/8
+# 作者: Auto-generated
+# 版本: 2.0
+# 
+# 使用方法：
+#   ./install_mysql.sh [端口号]
+#   
+# 示例：
+#   ./install_mysql.sh         # 安装默认3306端口实例
+#   ./install_mysql.sh 3306    # 安装3306端口实例
+#   ./install_mysql.sh 3307    # 安装3307端口实例
+#   ./install_mysql.sh 3308    # 安装3308端口实例
+#
+# 目录结构说明：
+#   端口3306（默认）：
+#     - 配置文件: /etc/my.cnf
+#     - 数据目录: /data/3306/data
+#     - 日志目录: /data/3306/log
+#   
+#   其他端口（如3307）：
+#     - 配置文件: /data/3307/conf/mysql_3307.cnf
+#     - 数据目录: /data/3307/data
+#     - 日志目录: /data/3307/log
 
-set -e
+set -e  # 遇到错误立即退出
 
 # 颜色定义
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
-PURPLE='\033[0;35m'
-CYAN='\033[0;36m'
-NC='\033[0m'
-
-# 全局变量
-SCRIPT_VERSION="2.0"
-SUPPORTED_K8S_VERSIONS=("v1.28.2" "v1.27.6" "v1.26.9" "v1.25.14")
-DEFAULT_K8S_VERSION="v1.28.2"
-DEFAULT_POD_CIDR="10.244.0.0/16"
-DEFAULT_SERVICE_CIDR="10.96.0.0/12"
+NC='\033[0m' # No Color
 
 # 日志函数
 log_info() {
-    echo -e "${BLUE}[INFO]${NC} $1"
+    echo -e "${GREEN}[INFO]${NC} $(date '+%Y-%m-%d %H:%M:%S') - $1"
 }
 
-log_success() {
-    echo -e "${GREEN}[SUCCESS]${NC} $1"
-}
-
-log_warning() {
-    echo -e "${YELLOW}[WARNING]${NC} $1"
+log_warn() {
+    echo -e "${YELLOW}[WARN]${NC} $(date '+%Y-%m-%d %H:%M:%S') - $1"
 }
 
 log_error() {
-    echo -e "${RED}[ERROR]${NC} $1"
+    echo -e "${RED}[ERROR]${NC} $(date '+%Y-%m-%d %H:%M:%S') - $1"
 }
 
 log_step() {
-    echo -e "${PURPLE}[STEP]${NC} $1"
+    echo -e "${BLUE}[STEP]${NC} $(date '+%Y-%m-%d %H:%M:%S') - $1"
 }
 
-log_header() {
-    echo -e "${CYAN}=== $1 ===${NC}"
-}
+# 初始化配置变量
+init_config() {
+    # 获取端口号参数
+    MYSQL_PORT="${1:-3306}"
 
-# 显示脚本信息
-show_banner() {
-    clear
-    echo "=================================================="
-    echo "      Kubernetes 完整安装脚本 v${SCRIPT_VERSION}"
-    echo "=================================================="
-    echo "支持功能："
-    echo "  ✓ Master 和 Worker 节点安装"
-    echo "  ✓ 多版本 Kubernetes 支持"
-    echo "  ✓ 自动主机名处理"
-    echo "  ✓ 网络配置优化"
-    echo "  ✓ 容器运行时配置"
-    echo "  ✓ 镜像源配置"
-    echo "  ✓ 问题自动修复"
-    echo "  ✓ 节点清理重新加入"
-    echo "=================================================="
-    echo
-}
-
-# 检查系统要求
-check_system_requirements() {
-    log_header "检查系统要求"
-    
-    # 检查权限
-    if [ "$EUID" -ne 0 ]; then
-        log_error "请使用 root 用户运行此脚本"
+    # 验证端口号
+    if ! [[ "$MYSQL_PORT" =~ ^[0-9]+$ ]] || [ "$MYSQL_PORT" -lt 1024 ] || [ "$MYSQL_PORT" -gt 65535 ]; then
+        echo "错误: 无效的端口号 '$MYSQL_PORT'"
+        echo "端口号必须是1024-65535之间的数字"
+        echo ""
+        echo "使用方法: $0 [端口号]"
+        echo "示例: $0 3306"
         exit 1
     fi
-    
-    # 检查操作系统
-    if [ -f /etc/redhat-release ]; then
-        OS="centos"
-        OS_VERSION=$(cat /etc/redhat-release | grep -oE '[0-9]+\.[0-9]+' | head -1)
-        log_success "检测到 CentOS/RHEL $OS_VERSION"
-    elif [ -f /etc/debian_version ]; then
-        OS="ubuntu"
-        OS_VERSION=$(cat /etc/os-release | grep VERSION_ID | cut -d'"' -f2)
-        log_success "检测到 Ubuntu/Debian $OS_VERSION"
+
+    # 基础配置变量
+    MYSQL_VERSION="8.0.32"
+    MYSQL_BASE_DIR="/usr/local/mysql"
+    MYSQL_USER="mysql"
+
+    # 根据端口号动态设置路径
+    if [[ "$MYSQL_PORT" == "3306" ]]; then
+        # 3306端口使用传统配置
+        MYSQL_DATA_DIR="/data/3306/data"
+        MYSQL_LOG_DIR="/data/3306/log"
+        MYSQL_CONFIG_FILE="/etc/my.cnf"
+        MYSQL_SOCKET="/tmp/mysql.sock"
     else
-        log_error "不支持的操作系统"
-        exit 1
+        # 其他端口使用独立目录结构
+        MYSQL_DATA_DIR="/data/${MYSQL_PORT}/data"
+        MYSQL_LOG_DIR="/data/${MYSQL_PORT}/log"
+        MYSQL_CONFIG_DIR="/data/${MYSQL_PORT}/conf"
+        MYSQL_CONFIG_FILE="${MYSQL_CONFIG_DIR}/mysql_${MYSQL_PORT}.cnf"
+        MYSQL_SOCKET="/tmp/mysql_${MYSQL_PORT}.sock"
     fi
+
+    # PID和日志文件路径（统一命名规则）
+    MYSQL_PID_FILE="${MYSQL_DATA_DIR}/mysql_${MYSQL_PORT}.pid"
+    MYSQL_ERROR_LOG="${MYSQL_LOG_DIR}/mysql_${MYSQL_PORT}.err"
+    MYSQL_SLOW_LOG="${MYSQL_LOG_DIR}/mysql_${MYSQL_PORT}_slow.log"
+}
+
+# 显示当前配置
+show_config() {
+    echo ""
+    echo "=========================================="
+    echo -e "${BLUE}MySQL ${MYSQL_VERSION} 实例配置信息${NC}"
+    echo "=========================================="
+    echo "端口号: $MYSQL_PORT"
+    echo "数据目录: $MYSQL_DATA_DIR"
+    echo "日志目录: $MYSQL_LOG_DIR"
+    echo "配置文件: $MYSQL_CONFIG_FILE"
+    echo "Socket文件: $MYSQL_SOCKET"
+    echo "PID文件: $MYSQL_PID_FILE"
+    echo "错误日志: $MYSQL_ERROR_LOG"
+    echo "慢查询日志: $MYSQL_SLOW_LOG"
     
-    # 检查内存 (至少 2GB)
-    MEMORY_GB=$(free -g | awk '/^Mem:/{print $2}')
-    if [ "$MEMORY_GB" -lt 2 ]; then
-        log_warning "内存少于 2GB，可能影响性能"
+    if [[ "$MYSQL_PORT" == "3306" ]]; then
+        echo ""
+        echo -e "${GREEN}注意: 端口3306使用传统配置结构${NC}"
     else
-        log_success "内存检查通过: ${MEMORY_GB}GB"
+        echo ""
+        echo -e "${BLUE}注意: 端口${MYSQL_PORT}使用独立目录结构${NC}"
+        echo "配置目录: $MYSQL_CONFIG_DIR"
     fi
+    echo "=========================================="
+    echo ""
     
-    # 检查磁盘空间 (至少 20GB)
-    DISK_GB=$(df / | awk 'NR==2{print int($4/1024/1024)}')
-    if [ "$DISK_GB" -lt 20 ]; then
-        log_warning "磁盘空间少于 20GB，可能不足"
-    else
-        log_success "磁盘空间检查通过: ${DISK_GB}GB 可用"
-    fi
-    
-    # 检查 CPU 核心数 (至少 2 核)
-    CPU_CORES=$(nproc)
-    if [ "$CPU_CORES" -lt 2 ]; then
-        log_warning "CPU 核心少于 2 个，可能影响性能"
-    else
-        log_success "CPU 检查通过: ${CPU_CORES} 核心"
+    read -p "确认使用以上配置继续安装？(y/n): " confirm
+    if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
+        echo "安装已取消"
+        exit 0
     fi
 }
 
-# 获取网络信息
-get_network_info() {
-    log_header "获取网络信息"
-    
-    # 获取主机名
-    CURRENT_HOSTNAME=$(hostname)
-    STATIC_HOSTNAME=$(hostnamectl --static 2>/dev/null || echo "$CURRENT_HOSTNAME")
-    
-    # 获取 IP 地址
-    CURRENT_IP=$(ip route get 8.8.8.8 2>/dev/null | grep -oP 'src \K\S+' || echo "")
-    if [ -z "$CURRENT_IP" ]; then
-        CURRENT_IP=$(ip addr show | grep 'inet ' | grep -v '127.0.0.1' | head -1 | awk '{print $2}' | cut -d'/' -f1)
-    fi
-    
-    # 获取网卡信息
-    MAIN_INTERFACE=$(ip route | grep default | awk '{print $5}' | head -1)
-    
-    log_info "当前主机名: $CURRENT_HOSTNAME"
-    log_info "静态主机名: $STATIC_HOSTNAME"
-    log_info "当前 IP: $CURRENT_IP"
-    log_info "主网卡: $MAIN_INTERFACE"
-    
-    # 导出变量供后续使用
-    export CURRENT_HOSTNAME STATIC_HOSTNAME CURRENT_IP MAIN_INTERFACE
-}
-
-# 配置主机名
-configure_hostname() {
-    log_header "配置主机名"
-    
-    echo "当前主机名: $CURRENT_HOSTNAME"
-    echo "当前 IP: $CURRENT_IP"
-    echo
-    echo "主机名配置选项："
-    echo "1) 保持当前主机名"
-    echo "2) 使用当前 IP 作为主机名"
-    echo "3) 自定义主机名"
-    echo "4) 自动生成主机名 (k8s-node-xxx)"
-    echo
-    
-    read -p "请选择主机名配置 (1-4): " hostname_choice
-    
-    case $hostname_choice in
-        1)
-            NEW_HOSTNAME="$CURRENT_HOSTNAME"
+# 获取MySQL下载URL
+get_mysql_download_url() {
+    case $MYSQL_VERSION in
+        "8.0.26")
+            echo "https://downloads.mysql.com/archives/get/p/23/file/mysql-8.0.26-linux-glibc2.12-x86_64.tar.xz"
             ;;
-        2)
-            NEW_HOSTNAME=$(echo "$CURRENT_IP" | tr '.' '-')
-            ;;
-        3)
-            read -p "请输入新的主机名: " NEW_HOSTNAME
-            ;;
-        4)
-            NEW_HOSTNAME="k8s-node-$(echo $CURRENT_IP | cut -d'.' -f4)"
+        "8.0.32")
+            echo "https://downloads.mysql.com/archives/get/p/23/file/mysql-8.0.32-linux-glibc2.12-x86_64.tar.xz"
             ;;
         *)
-            log_warning "无效选择，使用当前主机名"
-            NEW_HOSTNAME="$CURRENT_HOSTNAME"
-            ;;
-    esac
-    
-    if [ "$NEW_HOSTNAME" != "$CURRENT_HOSTNAME" ]; then
-        log_info "设置新主机名: $NEW_HOSTNAME"
-        hostnamectl set-hostname "$NEW_HOSTNAME"
-        
-        # 更新 /etc/hosts
-        if ! grep -q "$NEW_HOSTNAME" /etc/hosts; then
-            echo "$CURRENT_IP $NEW_HOSTNAME" >> /etc/hosts
-        fi
-        
-        log_success "主机名配置完成"
-        export CURRENT_HOSTNAME="$NEW_HOSTNAME"
-    else
-        log_info "保持当前主机名不变"
-    fi
-}
-
-# 选择安装模式
-select_install_mode() {
-    log_header "选择安装模式"
-    
-    echo "请选择安装模式："
-    echo "1) 安装 Master 节点（控制平面）"
-    echo "2) 安装 Worker 节点（工作节点）"
-    echo "3) 安装单节点集群（Master + Worker）"
-    echo "4) 只安装 Kubernetes 组件（不初始化）"
-    echo
-    
-    read -p "请选择安装模式 (1-4): " install_mode
-    
-    case $install_mode in
-        1)
-            INSTALL_MODE="master"
-            log_info "选择安装模式: Master 节点"
-            ;;
-        2)
-            INSTALL_MODE="worker"
-            log_info "选择安装模式: Worker 节点"
-            ;;
-        3)
-            INSTALL_MODE="single"
-            log_info "选择安装模式: 单节点集群"
-            ;;
-        4)
-            INSTALL_MODE="components-only"
-            log_info "选择安装模式: 仅安装组件"
-            ;;
-        *)
-            log_error "无效选择"
+            log_error "不支持的MySQL版本: $MYSQL_VERSION"
             exit 1
             ;;
     esac
-    
-    export INSTALL_MODE
 }
 
-# 选择 Kubernetes 版本
-select_k8s_version() {
-    log_header "选择 Kubernetes 版本"
+# 检查是否为root用户
+check_root() {
+    if [[ $EUID -ne 0 ]]; then
+        log_error "此脚本需要root权限运行"
+        exit 1
+    fi
+}
+
+# 检查系统版本
+check_system() {
+    log_step "检查系统环境"
     
-    echo "支持的 Kubernetes 版本："
-    for i in "${!SUPPORTED_K8S_VERSIONS[@]}"; do
-        version=${SUPPORTED_K8S_VERSIONS[$i]}
-        if [ "$version" = "$DEFAULT_K8S_VERSION" ]; then
-            echo "$((i+1))) $version (推荐)"
+    if [[ -f /etc/redhat-release ]]; then
+        local version=$(cat /etc/redhat-release)
+        log_info "系统版本: $version"
+        
+        # 检查是否为CentOS 8，需要额外的包
+        if echo "$version" | grep -q "release 8"; then
+            CENTOS8=true
         else
-            echo "$((i+1))) $version"
+            CENTOS8=false
         fi
-    done
-    echo "$((${#SUPPORTED_K8S_VERSIONS[@]}+1))) 自定义版本"
-    echo
-    
-    read -p "请选择版本 (1-$((${#SUPPORTED_K8S_VERSIONS[@]}+1))): " version_choice
-    
-    if [ "$version_choice" -gt 0 ] && [ "$version_choice" -le "${#SUPPORTED_K8S_VERSIONS[@]}" ]; then
-        K8S_VERSION=${SUPPORTED_K8S_VERSIONS[$((version_choice-1))]}
-    elif [ "$version_choice" -eq "$((${#SUPPORTED_K8S_VERSIONS[@]}+1))" ]; then
-        read -p "请输入自定义版本 (例如: v1.28.2): " K8S_VERSION
     else
-        log_warning "无效选择，使用默认版本"
-        K8S_VERSION="$DEFAULT_K8S_VERSION"
-    fi
-    
-    log_info "选择的 Kubernetes 版本: $K8S_VERSION"
-    export K8S_VERSION
-}
-
-# 配置网络参数
-configure_network() {
-    log_header "配置网络参数"
-    
-    if [ "$INSTALL_MODE" = "master" ] || [ "$INSTALL_MODE" = "single" ]; then
-        echo "网络配置："
-        echo "Pod 网络 CIDR (默认: $DEFAULT_POD_CIDR)"
-        read -p "请输入 Pod CIDR [回车使用默认]: " input_pod_cidr
-        POD_CIDR=${input_pod_cidr:-$DEFAULT_POD_CIDR}
-        
-        echo "Service 网络 CIDR (默认: $DEFAULT_SERVICE_CIDR)"
-        read -p "请输入 Service CIDR [回车使用默认]: " input_service_cidr
-        SERVICE_CIDR=${input_service_cidr:-$DEFAULT_SERVICE_CIDR}
-        
-        log_info "Pod CIDR: $POD_CIDR"
-        log_info "Service CIDR: $SERVICE_CIDR"
-        
-        export POD_CIDR SERVICE_CIDR
+        log_error "不支持的操作系统，此脚本仅支持CentOS/RHEL"
+        exit 1
     fi
 }
 
-# 系统环境配置
-configure_system_environment() {
-    log_header "配置系统环境"
+# 环境准备
+prepare_environment() {
+    log_step "准备系统环境"
     
-    # 关闭 swap
-    log_step "关闭 swap"
-    swapoff -a
-    sed -i '/swap/d' /etc/fstab
+    # 关闭SELinux
+    log_info "关闭SELinux"
+    setenforce 0 2>/dev/null || true
+    sed -i 's#SELINUX=enforcing#SELINUX=disabled#g' /etc/selinux/config
     
-    # 关闭 SELinux (CentOS)
-    if [ "$OS" = "centos" ]; then
-        log_step "关闭 SELinux"
-        setenforce 0 2>/dev/null || true
-        sed -i 's/^SELINUX=enforcing$/SELINUX=disabled/' /etc/selinux/config 2>/dev/null || true
-    fi
-    
-    # 配置防火墙
-    log_step "配置防火墙"
-    if [ "$OS" = "centos" ]; then
-        systemctl stop firewalld 2>/dev/null || true
-        systemctl disable firewalld 2>/dev/null || true
+    # 卸载MariaDB
+    log_info "卸载已存在的MariaDB包"
+    local mariadb_packages=$(rpm -qa | grep mariadb 2>/dev/null || true)
+    if [[ -n "$mariadb_packages" ]]; then
+        yum remove mariadb-libs -y 2>/dev/null || true
+        log_info "已卸载MariaDB相关包"
     else
-        ufw disable 2>/dev/null || true
+        log_info "未发现MariaDB包"
     fi
     
-    # 配置内核参数
-    log_step "配置内核参数"
-    cat > /etc/sysctl.d/k8s.conf << EOF
-net.bridge.bridge-nf-call-ip6tables = 1
-net.bridge.bridge-nf-call-iptables = 1
-net.ipv4.ip_forward = 1
-vm.swappiness = 0
+    # 安装依赖包
+    log_info "安装依赖包"
+    yum install -y ncurses ncurses-devel libaio-devel openssl openssl-devel wget
+    
+    # CentOS 8 需要额外的包
+    if [[ "$CENTOS8" == "true" ]]; then
+        log_info "检测到CentOS 8，安装额外依赖包"
+        yum install -y ncurses-compat-libs
+    fi
+    
+    # 关闭防火墙
+    log_info "关闭防火墙"
+    systemctl stop firewalld 2>/dev/null || true
+    systemctl disable firewalld 2>/dev/null || true
+    
+    log_info "环境准备完成"
+}
+
+# 创建MySQL用户
+create_mysql_user() {
+    log_step "创建MySQL用户"
+    
+    if id "$MYSQL_USER" &>/dev/null; then
+        log_warn "MySQL用户已存在"
+    else
+        useradd "$MYSQL_USER" -s /sbin/nologin -M
+        log_info "MySQL用户创建成功"
+    fi
+}
+
+# 下载并安装MySQL
+download_and_install_mysql() {
+    log_step "下载并安装MySQL"
+    
+    local download_url=$(get_mysql_download_url)
+    local filename="mysql-${MYSQL_VERSION}-linux-glibc2.12-x86_64.tar.xz"
+    local download_path="/usr/local/$filename"
+    
+    # 检查是否已经存在MySQL目录
+    if [[ -d "$MYSQL_BASE_DIR" ]]; then
+        log_warn "MySQL目录已存在，跳过下载"
+    else
+        # 下载MySQL
+        log_info "开始下载MySQL $MYSQL_VERSION"
+        if [[ ! -f "$download_path" ]]; then
+            wget -P /usr/local "$download_url"
+            log_info "MySQL下载完成"
+        else
+            log_info "MySQL安装包已存在，跳过下载"
+        fi
+        
+        # 解压MySQL
+        log_info "解压MySQL安装包"
+        cd /usr/local
+        tar xf "$filename"
+        
+        # 创建软链接
+        ln -sf "/usr/local/mysql-${MYSQL_VERSION}-linux-glibc2.12-x86_64" "$MYSQL_BASE_DIR"
+        log_info "MySQL软链接创建完成"
+    fi
+    
+    # 设置环境变量
+    log_info "配置环境变量"
+    if ! grep -q "export PATH=\"$MYSQL_BASE_DIR/bin:\$PATH\"" /etc/profile; then
+        echo "export PATH=\"$MYSQL_BASE_DIR/bin:\$PATH\"" >> /etc/profile
+    fi
+    
+    # 为当前会话设置PATH
+    export PATH="$MYSQL_BASE_DIR/bin:$PATH"
+    
+    # 验证安装
+    if [[ -f "$MYSQL_BASE_DIR/bin/mysql" ]]; then
+        local mysql_version_output=$($MYSQL_BASE_DIR/bin/mysql -V)
+        log_info "MySQL版本信息: $mysql_version_output"
+        log_info "MySQL二进制文件路径: $MYSQL_BASE_DIR/bin"
+    else
+        log_error "MySQL安装验证失败，找不到mysql命令"
+        exit 1
+    fi
+}
+
+# 创建数据目录和配置文件
+setup_mysql_config() {
+    log_step "创建目录结构和配置文件"
+    
+    # 创建必要的目录
+    log_info "创建MySQL目录结构"
+    mkdir -pv "$MYSQL_DATA_DIR"
+    mkdir -pv "$MYSQL_LOG_DIR"
+    
+    # 如果不是3306端口，创建配置目录
+    if [[ "$MYSQL_PORT" != "3306" ]]; then
+        mkdir -pv "$MYSQL_CONFIG_DIR"
+    fi
+    
+    # 设置目录权限
+    chown -R "$MYSQL_USER:$MYSQL_USER" "/data/${MYSQL_PORT}"
+    
+    # 创建配置文件
+    log_info "创建MySQL配置文件: $MYSQL_CONFIG_FILE"
+    
+    # 配置文件目录权限（如果不是/etc目录）
+    if [[ "$MYSQL_PORT" != "3306" ]]; then
+        chown -R "$MYSQL_USER:$MYSQL_USER" "$MYSQL_CONFIG_DIR"
+    fi
+    
+    cat > "$MYSQL_CONFIG_FILE" <<EOF
+[mysqld]
+user=$MYSQL_USER
+basedir=$MYSQL_BASE_DIR
+datadir=$MYSQL_DATA_DIR
+port=$MYSQL_PORT
+socket=$MYSQL_SOCKET
+pid-file=$MYSQL_PID_FILE
+
+# 安全设置
+skip-name-resolve
+default-authentication-plugin=mysql_native_password
+bind-address=0.0.0.0
+
+# 字符集设置
+character-set-server=utf8mb4
+collation-server=utf8mb4_unicode_ci
+
+# InnoDB设置
+innodb_buffer_pool_size=256M
+innodb_log_file_size=64M
+innodb_flush_log_at_trx_commit=1
+innodb_lock_wait_timeout=50
+innodb_file_per_table=1
+
+# 连接设置
+max_connections=200
+max_connect_errors=10
+wait_timeout=28800
+interactive_timeout=28800
+
+# 日志设置
+log-error=$MYSQL_ERROR_LOG
+slow_query_log=1
+slow_query_log_file=$MYSQL_SLOW_LOG
+long_query_time=2
+
+# 性能设置
+query_cache_type=0
+query_cache_size=0
+
+[client]
+socket=$MYSQL_SOCKET
+default-character-set=utf8mb4
+port=$MYSQL_PORT
+
+[mysql]
+default-character-set=utf8mb4
+
+[mysqldump]
+default-character-set=utf8mb4
 EOF
     
-    # 加载内核模块
-    modprobe br_netfilter 2>/dev/null || true
-    modprobe overlay 2>/dev/null || true
-    echo "br_netfilter" > /etc/modules-load.d/br_netfilter.conf
-    echo "overlay" > /etc/modules-load.d/overlay.conf
+    log_info "MySQL配置文件创建完成"
     
-    # 应用内核参数
-    sysctl --system >/dev/null
-    
-    # 配置时间同步
-    log_step "配置时间同步"
-    if [ "$OS" = "centos" ]; then
-        yum install -y chrony >/dev/null 2>&1 || true
-        systemctl enable chronyd >/dev/null 2>&1 || true
-        systemctl start chronyd >/dev/null 2>&1 || true
-    else
-        apt-get update >/dev/null 2>&1
-        apt-get install -y chrony >/dev/null 2>&1 || true
-        systemctl enable chrony >/dev/null 2>&1 || true
-        systemctl start chrony >/dev/null 2>&1 || true
-    fi
-    
-    log_success "系统环境配置完成"
-}
-
-# 安装容器运行时
-install_container_runtime() {
-    log_header "安装容器运行时"
-    
-    echo "选择容器运行时："
-    echo "1) containerd (推荐，Kubernetes 原生支持)"
-    echo "2) Docker (官方脚本安装，功能完整)"
-    echo
-    
-    read -p "请选择容器运行时 (1-2): " runtime_choice
-    
-    case $runtime_choice in
-        1)
-            INSTALL_DOCKER=false
-            INSTALL_METHOD="containerd"
-            ;;
-        2)
-            INSTALL_DOCKER=true
-            INSTALL_METHOD="official_script"
-            ;;
-        *)
-            log_warning "无效选择，使用默认选项 containerd"
-            INSTALL_DOCKER=false
-            INSTALL_METHOD="containerd"
-            ;;
-    esac
-    
-    log_info "选择的安装方式: $INSTALL_METHOD"
-    
-    # 安装基础依赖
-    if [ "$OS" = "centos" ]; then
-        log_step "安装容器运行时依赖"
-        yum install -y yum-utils device-mapper-persistent-data lvm2
-    else
-        log_step "安装容器运行时依赖"
-        apt-get update
-        apt-get install -y apt-transport-https ca-certificates curl gnupg lsb-release
-    fi
-    
-    # 根据选择的方法安装
-    case $INSTALL_METHOD in
-        "official_script")
-            install_docker_official_script
-            ;;
-        "containerd")
-            install_containerd_only
-            ;;
-    esac
-    
-    log_success "容器运行时安装完成"
-}
-
-# 使用 Docker 官方脚本安装
-install_docker_official_script() {
-    log_step "使用 Docker 官方脚本安装"
-    
-    # 下载官方安装脚本
-    log_info "下载 Docker 官方安装脚本..."
-    if curl -fsSL https://get.docker.com -o get-docker.sh; then
-        log_success "脚本下载成功"
-    else
-        log_error "脚本下载失败，请检查网络连接"
-        exit 1
-    fi
-    
-    # 检查脚本文件
-    if [ ! -f get-docker.sh ] || [ ! -s get-docker.sh ]; then
-        log_error "安装脚本无效"
-        rm -f get-docker.sh
-        exit 1
-    fi
-    
-    # 执行安装脚本
-    log_info "执行 Docker 官方安装脚本（这可能需要几分钟）..."
-    if sh get-docker.sh; then
-        log_success "Docker 官方脚本安装成功"
-        rm -f get-docker.sh
-        
-        # 配置 Docker
-        configure_docker_daemon
-        
-        # 启动服务
-        systemctl enable docker
-        if systemctl start docker; then
-            log_success "Docker 服务启动成功"
-        else
-            log_error "Docker 服务启动失败"
-            log_info "查看错误信息："
-            systemctl status docker --no-pager -l
-            
-            # 尝试修复
-            fix_docker_startup_issues
-        fi
-    else
-        log_error "Docker 官方脚本安装失败"
-        rm -f get-docker.sh
-        exit 1
-    fi
-}
-
-# 仅安装 containerd
-install_containerd_only() {
-    log_step "安装 containerd"
-    
-    if [ "$OS" = "centos" ]; then
-        # 添加 Docker 仓库（containerd 包含在其中）
-        if ! yum repolist | grep -q docker-ce; then
-            yum-config-manager --add-repo https://download.docker.com/linux/centos/docker-ce.repo
-            yum makecache fast
-        fi
-        
-        # 尝试多种方式安装 containerd
-        if yum list available containerd.io >/dev/null 2>&1; then
-            yum install -y containerd.io
-        elif yum list available containerd >/dev/null 2>&1; then
-            log_warning "使用系统自带的 containerd 包"
-            yum install -y containerd
-        else
-            log_error "无法找到 containerd 包，尝试手动安装"
-            # 手动下载安装
-            CONTAINERD_VERSION="1.6.33-3.1.el7"
-            CONTAINERD_URL="https://download.docker.com/linux/centos/7/x86_64/stable/Packages/containerd.io-${CONTAINERD_VERSION}.x86_64.rpm"
-            
-            log_info "下载 containerd RPM 包..."
-            if wget -O /tmp/containerd.io.rpm "$CONTAINERD_URL"; then
-                log_info "安装 containerd RPM 包..."
-                yum localinstall -y /tmp/containerd.io.rpm
-                rm -f /tmp/containerd.io.rpm
-            else
-                log_error "containerd 安装失败"
-                exit 1
-            fi
-        fi
-        
-    else
-        # Ubuntu 安装
-        if ! apt-cache search containerd.io | grep -q containerd.io; then
-            curl -fsSL https://download.docker.com/linux/ubuntu/gpg | gpg --dearmor -o /usr/share/keyrings/docker-archive-keyring.gpg
-            echo "deb [arch=amd64 signed-by=/usr/share/keyrings/docker-archive-keyring.gpg] https://download.docker.com/linux/ubuntu $(lsb_release -cs) stable" > /etc/apt/sources.list.d/docker.list
-            apt-get update
-        fi
-        
-        apt-get install -y containerd.io
-    fi
-    
-    # 配置 containerd
-    configure_containerd
-    
-    # 启动 containerd
-    systemctl enable containerd
-    systemctl restart containerd
-}
-
-# 配置 Docker daemon
-configure_docker_daemon() {
-    log_step "配置 Docker daemon"
-    
-    mkdir -p /etc/docker
-    cat > /etc/docker/daemon.json << 'EOF'
-{
-  "exec-opts": ["native.cgroupdriver=systemd"],
-  "log-driver": "json-file",
-  "log-opts": {
-    "max-size": "100m",
-    "max-file": "3"
-  },
-  "storage-driver": "overlay2",
-  "live-restore": true
-}
-EOF
-    
-    log_success "Docker daemon 配置完成"
-}
-
-# 配置 containerd
-configure_containerd() {
-    log_step "配置 containerd"
-    
-    mkdir -p /etc/containerd
-    containerd config default > /etc/containerd/config.toml
-    
-    # 修改 containerd 配置
-    sed -i 's/SystemdCgroup = false/SystemdCgroup = true/' /etc/containerd/config.toml
-    sed -i '/disabled_plugins/s/\["cri"\]/[]/' /etc/containerd/config.toml
-    
-    # 配置镜像源（国外服务器可能不需要，但保留以防万一）
-    if grep -q "registry.k8s.io/pause" /etc/containerd/config.toml; then
-        sed -i 's|registry.k8s.io/pause|registry.k8s.io/pause|' /etc/containerd/config.toml
-    fi
-    
-    log_success "containerd 配置完成"
-}
-
-# 修复 Docker 启动问题
-fix_docker_startup_issues() {
-    log_step "尝试修复 Docker 启动问题"
-    
-    # 停止服务
-    systemctl stop docker containerd 2>/dev/null || true
-    
-    # 清理可能的问题文件
-    rm -f /var/lib/docker/daemon.pid 2>/dev/null || true
-    
-    # 检查存储驱动
-    if [ ! -d /var/lib/docker ]; then
-        mkdir -p /var/lib/docker
-    fi
-    
-    # 重新启动服务
-    systemctl start containerd
+    # 显示配置文件内容
+    echo ""
+    log_info "MySQL配置文件内容如下："
+    echo "----------------------------------------"
+    cat "$MYSQL_CONFIG_FILE"
+    echo "----------------------------------------"
+    echo ""
+    log_info "配置文件显示完成，3秒后继续..."
     sleep 3
+}
+
+# 初始化MySQL数据库
+initialize_mysql() {
+    log_step "初始化MySQL数据库"
     
-    if systemctl start docker; then
-        log_success "Docker 修复成功"
+    # 检查数据目录是否已经初始化
+    if [[ -f "$MYSQL_DATA_DIR/mysql/user.frm" ]] || [[ -f "$MYSQL_DATA_DIR/mysql.ibd" ]]; then
+        log_warn "MySQL数据库已经初始化，跳过初始化步骤"
+        return 0
+    fi
+    
+    log_info "开始初始化MySQL数据库（使用空密码）"
+    
+    # 确保PATH包含MySQL二进制文件路径
+    export PATH="$MYSQL_BASE_DIR/bin:$PATH"
+    
+    # 确保目录权限正确
+    chown -R "$MYSQL_USER:$MYSQL_USER" "/data/${MYSQL_PORT}"
+    
+    # 初始化数据库 - 不使用配置文件，避免配置冲突
+    log_info "执行MySQL初始化命令"
+    "$MYSQL_BASE_DIR/bin/mysqld" --initialize-insecure \
+        --user="$MYSQL_USER" \
+        --basedir="$MYSQL_BASE_DIR" \
+        --datadir="$MYSQL_DATA_DIR"
+    
+    # 检查初始化是否成功
+    if [[ $? -eq 0 ]]; then
+        log_info "MySQL数据库初始化完成"
+        log_warn "注意: root用户初始密码为空，请在启动后立即设置密码！"
     else
-        log_error "Docker 修复失败"
-        log_info "详细错误信息："
-        journalctl -u docker.service -n 10 --no-pager
-        
-        # 提供选择
-        echo
-        read -p "是否切换到仅使用 containerd？(y/N): " -n 1 -r
-        echo
-        if [[ $REPLY =~ ^[Yy]$ ]]; then
-            systemctl stop docker 2>/dev/null || true
-            systemctl disable docker 2>/dev/null || true
-            INSTALL_DOCKER=false
-            INSTALL_METHOD="containerd"
-            log_info "已切换到仅使用 containerd"
-        else
-            log_error "请手动解决 Docker 问题后重新运行脚本"
-            exit 1
-        fi
+        log_error "MySQL数据库初始化失败"
+        exit 1
     fi
 }
 
-# 验证容器运行时安装
-verify_container_runtime() {
-    log_step "验证容器运行时安装"
+# 配置MySQL启动脚本
+setup_mysql_service() {
+    log_step "配置MySQL启动脚本"
     
-    # 验证 containerd
-    if systemctl is-active containerd >/dev/null 2>&1; then
-        log_success "containerd 运行正常"
-        if command -v crictl >/dev/null 2>&1; then
-            crictl version 2>/dev/null || log_warning "crictl 连接失败（正常现象，K8s 初始化后会正常）"
-        fi
+    # 复制启动脚本
+    if [[ -f "$MYSQL_BASE_DIR/support-files/mysql.server" ]]; then
+        cp "$MYSQL_BASE_DIR/support-files/mysql.server" /etc/init.d/mysqld
+        chmod +x /etc/init.d/mysqld
+        
+        # 设置开机自启
+        /sbin/chkconfig mysqld on
+        log_info "MySQL启动脚本配置完成"
     else
-        log_error "containerd 未运行"
-        return 1
+        log_error "找不到MySQL启动脚本"
+        exit 1
+    fi
+}
+
+# 创建systemd服务文件
+create_systemd_service() {
+    log_step "创建systemd服务文件"
+    
+    log_info "检测到systemd系统，正在创建MySQL systemd服务文件"
+    
+    # 创建systemd服务文件
+    cat > /etc/systemd/system/mysqld_${MYSQL_PORT}.service <<EOF
+[Unit]
+Description=MySQL Community Server (Port $MYSQL_PORT)
+Documentation=man:mysqld(8)
+Documentation=http://dev.mysql.com/doc/refman/en/using-systemd.html
+After=network.target
+After=syslog.target
+
+[Install]
+WantedBy=multi-user.target
+
+[Service]
+User=$MYSQL_USER
+Group=$MYSQL_USER
+
+# 服务类型为forking，因为mysqld_safe会fork出mysqld进程
+Type=forking
+
+# PID文件路径 - 包含端口号支持多实例
+PIDFile=$MYSQL_PID_FILE
+
+# 启动前的准备工作
+ExecStartPre=/usr/bin/mkdir -p $MYSQL_DATA_DIR
+ExecStartPre=/usr/bin/mkdir -p $MYSQL_LOG_DIR
+ExecStartPre=/usr/bin/chown -R $MYSQL_USER:$MYSQL_USER /data/${MYSQL_PORT}
+ExecStartPre=/usr/bin/touch $MYSQL_PID_FILE
+ExecStartPre=/usr/bin/chown $MYSQL_USER:$MYSQL_USER $MYSQL_PID_FILE
+
+# 启动命令 - 使用mysqld_safe启动
+ExecStart=$MYSQL_BASE_DIR/bin/mysqld_safe --defaults-file=$MYSQL_CONFIG_FILE --pid-file=$MYSQL_PID_FILE --daemonize
+
+# 停止命令 - 使用mysqladmin安全关闭
+ExecStop=$MYSQL_BASE_DIR/bin/mysqladmin -u root -S $MYSQL_SOCKET shutdown
+
+# 重新加载配置
+ExecReload=/bin/kill -HUP \$MAINPID
+
+# 重启策略
+Restart=on-failure
+RestartPreventExitStatus=1
+
+# 超时设置 - 增加启动超时时间
+TimeoutStartSec=300
+TimeoutStopSec=120
+
+# 安全设置
+PrivateTmp=false
+PrivateNetwork=false
+PrivateDevices=false
+
+# 资源限制
+LimitNOFILE=65535
+LimitNPROC=65535
+
+# 工作目录
+WorkingDirectory=$MYSQL_BASE_DIR
+
+# 环境变量
+Environment=PATH=$MYSQL_BASE_DIR/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin
+EOF
+
+    log_info "systemd服务文件创建完成: /etc/systemd/system/mysqld_${MYSQL_PORT}.service"
+    
+    # 显示服务文件内容
+    echo ""
+    log_info "MySQL systemd服务文件内容："
+    echo "----------------------------------------"
+    cat /etc/systemd/system/mysqld_${MYSQL_PORT}.service
+    echo "----------------------------------------"
+    echo ""
+    
+    # 重新加载systemd配置
+    log_info "重新加载systemd配置"
+    systemctl daemon-reload
+    
+    log_info "systemd服务配置完成，3秒后继续..."
+    sleep 3
+}
+
+# 配置systemd服务（可选）
+setup_systemd_service() {
+    log_step "配置MySQL服务启动方式"
+    
+    # 定义服务名称（包含端口号）
+    local service_name="mysqld_${MYSQL_PORT}"
+    
+    # 检查系统是否支持systemd
+    if command -v systemctl >/dev/null 2>&1 && [[ -d /etc/systemd/system ]]; then
+        echo ""
+        echo -e "${YELLOW}检测到systemd系统，请选择MySQL服务管理方式：${NC}"
+        echo "1) 创建systemd服务文件 (推荐) - 使用systemctl管理"
+        echo "2) 仅使用传统init.d脚本 - 使用service命令管理"
+        echo "3) 两种方式都配置 - 最大兼容性"
+        echo ""
+        read -p "请输入选择 (1/2/3): " choice
+        
+        case "$choice" in
+            1)
+                log_info "选择创建systemd服务文件"
+                create_systemd_service
+                
+                # 尝试启用systemd服务
+                log_info "启用MySQL systemd服务: $service_name"
+                if systemctl enable "$service_name"; then
+                    log_info "systemd服务启用成功！"
+                    echo ""
+                    echo -e "${GREEN}可以使用以下systemctl命令管理MySQL (端口$MYSQL_PORT)：${NC}"
+                    echo "  启动: systemctl start $service_name"
+                    echo "  停止: systemctl stop $service_name"
+                    echo "  重启: systemctl restart $service_name"
+                    echo "  状态: systemctl status $service_name"
+                    echo "  开机自启: systemctl enable $service_name"
+                else
+                    log_error "systemd服务启用失败"
+                    # 回退到chkconfig方式
+                    log_info "回退到chkconfig方式"
+                    /sbin/chkconfig mysqld on
+                fi
+                ;;
+            2)
+                log_info "选择仅使用传统init.d脚本"
+                /sbin/chkconfig mysqld on
+                log_info "已通过chkconfig启用MySQL服务"
+                ;;
+            3)
+                log_info "选择配置两种启动方式"
+                create_systemd_service
+                
+                # 先尝试systemd方式
+                if systemctl enable "$service_name" 2>/dev/null; then
+                    log_info "systemd服务启用成功"
+                else
+                    log_warn "systemd启用失败，使用chkconfig作为备选"
+                    /sbin/chkconfig mysqld on
+                fi
+                
+                log_info "两种启动方式都已配置完成"
+                ;;
+            *)
+                log_warn "无效选择，使用默认的chkconfig方式"
+                /sbin/chkconfig mysqld on
+                ;;
+        esac
+    else
+        log_info "未检测到systemd，使用传统的chkconfig方式"
+        /sbin/chkconfig mysqld on
     fi
     
-    # 如果安装了 Docker，验证 Docker
-    if [ "$INSTALL_DOCKER" = "true" ] && systemctl is-enabled docker >/dev/null 2>&1; then
-        if systemctl is-active docker >/dev/null 2>&1; then
-            log_success "Docker 运行正常"
-            docker version --format '{{.Server.Version}}' 2>/dev/null || log_warning "Docker 版本获取失败"
-            
-            # 运行测试容器
-            log_info "测试 Docker 功能..."
-            if timeout 30s docker run --rm hello-world >/dev/null 2>&1; then
-                log_success "Docker 功能测试通过"
-            else
-                log_warning "Docker 功能测试失败，但基本功能可能正常"
-            fi
+    echo ""
+    log_info "服务配置完成，继续安装流程..."
+    sleep 2
+}
+
+# 启动MySQL服务
+start_mysql() {
+    log_step "启动MySQL服务"
+    
+    # 检查MySQL是否已经在运行
+    if pgrep -f mysqld >/dev/null; then
+        log_warn "MySQL服务已经在运行"
+        return 0
+    fi
+    
+    # 定义服务名称
+    local service_name="mysqld_${MYSQL_PORT}"
+    
+    # 检查是否存在systemd服务文件
+    if [[ -f "/etc/systemd/system/${service_name}.service" ]] && command -v systemctl >/dev/null 2>&1; then
+        log_info "使用systemd方式启动MySQL服务: $service_name"
+        
+        # 清理可能存在的旧PID文件
+        if [[ -f "$MYSQL_PID_FILE" ]]; then
+            log_info "清理旧的PID文件: $MYSQL_PID_FILE"
+            rm -f "$MYSQL_PID_FILE"
+        fi
+        
+        # 确保目录权限正确
+        chown -R "$MYSQL_USER:$MYSQL_USER" "/data/${MYSQL_PORT}"
+        
+        # 使用systemctl启动
+        log_info "执行: systemctl start $service_name"
+        if systemctl start "$service_name"; then
+            log_info "MySQL服务通过systemd启动成功"
         else
-            log_error "Docker 未运行"
+            log_error "systemd启动失败，开始故障排除"
+            troubleshoot_mysql_startup
             return 1
         fi
-    fi
-    
-    return 0
-}
-
-# 检测并处理混合容器运行时
-check_mixed_runtime_compatibility() {
-    log_step "检查容器运行时兼容性"
-    
-    # 检测当前节点的容器运行时
-    local current_runtime=""
-    if systemctl is-active docker >/dev/null 2>&1; then
-        current_runtime="docker"
-        log_info "当前节点运行时: Docker"
-    elif systemctl is-active containerd >/dev/null 2>&1; then
-        current_runtime="containerd"
-        log_info "当前节点运行时: containerd"
     else
-        log_error "未检测到运行中的容器运行时"
-        return 1
+        log_info "使用传统init.d方式启动MySQL服务"
+        /etc/init.d/mysqld start
     fi
     
-    # 如果是 Worker 节点，询问 Master 节点的运行时
-    if [ "$INSTALL_MODE" = "worker" ]; then
-        echo
-        echo "Master 节点使用的容器运行时："
-        echo "1) Docker"
-        echo "2) containerd"
-        echo "3) 不确定"
-        echo
-        read -p "请选择 Master 节点的运行时 (1-3): " master_runtime_choice
-        
-        case $master_runtime_choice in
-            1)
-                master_runtime="docker"
-                ;;
-            2)
-                master_runtime="containerd"
-                ;;
-            3)
-                log_info "将跳过运行时兼容性检查"
-                return 0
-                ;;
-            *)
-                log_warning "无效选择，跳过兼容性检查"
-                return 0
-                ;;
-        esac
-        
-        # 检查混合运行时情况
-        if [ "$current_runtime" != "$master_runtime" ]; then
-            log_warning "检测到混合容器运行时环境："
-            echo "  Master 节点: $master_runtime"
-            echo "  Worker 节点: $current_runtime"
-            echo
+    # 等待MySQL启动完成
+    local retry_count=0
+    local max_retries=60  # 增加重试次数
+    
+    log_info "等待MySQL完全启动..."
+    while [[ $retry_count -lt $max_retries ]]; do
+        if "$MYSQL_BASE_DIR/bin/mysqladmin" ping -h localhost >/dev/null 2>&1; then
+            log_info "MySQL服务启动成功"
             
-            echo "建议的处理方案："
-            echo "1) 继续使用混合运行时（需要确保配置兼容）"
-            echo "2) 切换当前节点运行时与 Master 保持一致"
-            echo "3) 忽略此检查"
-            echo
+            # 显示MySQL进程信息
+            echo ""
+            log_info "MySQL进程信息："
+            ps aux | grep -E '[m]ysql' | head -5
+            echo ""
             
-            read -p "请选择方案 (1-3): " compat_choice
+            # 显示端口监听情况
+            log_info "MySQL端口监听情况："
+            netstat -tlnp 2>/dev/null | grep ":$MYSQL_PORT " || ss -tlnp | grep ":$MYSQL_PORT "
+            echo ""
             
-            case $compat_choice in
-                1)
-                    log_info "继续使用混合运行时"
-                    ensure_compatible_config "$current_runtime"
-                    ;;
-                2)
-                    switch_container_runtime "$master_runtime"
-                    ;;
-                3)
-                    log_info "忽略兼容性检查"
-                    ;;
-                *)
-                    log_warning "无效选择，继续使用当前配置"
-                    ;;
-            esac
-        else
-            log_success "容器运行时一致，无需额外配置"
-        fi
-    fi
-}
-
-# 确保兼容的配置
-ensure_compatible_config() {
-    local runtime=$1
-    log_step "确保 $runtime 配置兼容"
-    
-    if [ "$runtime" = "docker" ]; then
-        # 确保 Docker 配置兼容
-        mkdir -p /etc/docker
-        cat > /etc/docker/daemon.json << 'EOF'
-{
-  "exec-opts": ["native.cgroupdriver=systemd"],
-  "storage-driver": "overlay2",
-  "log-driver": "json-file",
-  "log-opts": {
-    "max-size": "100m",
-    "max-file": "3"
-  },
-  "live-restore": true
-}
-EOF
-        systemctl restart docker
-        log_success "Docker 配置已优化"
-        
-    elif [ "$runtime" = "containerd" ]; then
-        # 确保 containerd 配置兼容
-        mkdir -p /etc/containerd
-        containerd config default > /etc/containerd/config.toml
-        
-        # 启用 SystemdCgroup
-        sed -i 's/SystemdCgroup = false/SystemdCgroup = true/' /etc/containerd/config.toml
-        
-        # 确保使用标准的 pause 镜像
-        sed -i 's|registry.k8s.io/pause|registry.k8s.io/pause|' /etc/containerd/config.toml
-        
-        systemctl restart containerd
-        log_success "containerd 配置已优化"
-    fi
-}
-
-# 切换容器运行时
-switch_container_runtime() {
-    local target_runtime=$1
-    log_step "切换到 $target_runtime 运行时"
-    
-    echo
-    log_warning "切换容器运行时需要重新安装，这将："
-    echo "  1. 停止当前容器运行时"
-    echo "  2. 安装目标运行时"
-    echo "  3. 重新配置 kubelet"
-    echo
-    
-    read -p "确认切换？(y/N): " -n 1 -r
-    echo
-    if [[ ! $REPLY =~ ^[Yy]$ ]]; then
-        log_info "取消切换"
-        return 0
-    fi
-    
-    if [ "$target_runtime" = "docker" ]; then
-        # 切换到 Docker
-        systemctl stop containerd
-        systemctl disable containerd
-        
-        # 安装 Docker
-        install_docker_official_script
-        
-    elif [ "$target_runtime" = "containerd" ]; then
-        # 切换到 containerd
-        systemctl stop docker
-        systemctl disable docker
-        
-        # 重新配置 containerd
-        install_containerd_only
-        
-        # 更新 kubelet 配置
-        if [ -f /var/lib/kubelet/kubeadm-flags.env ]; then
-            sed -i 's/--container-runtime=docker/--container-runtime=remote/' /var/lib/kubelet/kubeadm-flags.env
-            sed -i 's/--container-runtime-endpoint=.*/--container-runtime-endpoint=unix:\/\/\/var\/run\/containerd\/containerd.sock/' /var/lib/kubelet/kubeadm-flags.env
-        fi
-    fi
-    
-    systemctl restart kubelet
-    log_success "容器运行时切换完成"
-}
-
-# 安装 Kubernetes 组件
-install_kubernetes_components() {
-    log_header "安装 Kubernetes 组件"
-    
-    if [ "$OS" = "centos" ]; then
-        # CentOS 安装
-        log_step "添加 Kubernetes yum 源"
-        cat > /etc/yum.repos.d/kubernetes.repo << EOF
-[kubernetes]
-name=Kubernetes
-baseurl=https://mirrors.aliyun.com/kubernetes/yum/repos/kubernetes-el7-x86_64/
-enabled=1
-gpgcheck=1
-repo_gpgcheck=1
-gpgkey=https://mirrors.aliyun.com/kubernetes/yum/doc/yum-key.gpg https://mirrors.aliyun.com/kubernetes/yum/doc/rpm-package-key.gpg
-EOF
-        
-        # 计算版本号
-        K8S_VERSION_NUM=$(echo $K8S_VERSION | sed 's/v//')
-        
-        log_step "安装 Kubernetes 组件"
-        yum install -y kubelet-${K8S_VERSION_NUM} kubeadm-${K8S_VERSION_NUM} kubectl-${K8S_VERSION_NUM}
-        
-    else
-        # Ubuntu 安装
-        log_step "添加 Kubernetes apt 源"
-        apt-get update && apt-get install -y apt-transport-https curl
-        curl -s https://mirrors.aliyun.com/kubernetes/apt/doc/apt-key.gpg | apt-key add -
-        echo "deb https://mirrors.aliyun.com/kubernetes/apt/ kubernetes-xenial main" > /etc/apt/sources.list.d/kubernetes.list
-        
-        apt-get update
-        
-        # 计算版本号
-        K8S_VERSION_NUM=$(echo $K8S_VERSION | sed 's/v//')
-        
-        log_step "安装 Kubernetes 组件"
-        apt-get install -y kubelet=${K8S_VERSION_NUM}-00 kubeadm=${K8S_VERSION_NUM}-00 kubectl=${K8S_VERSION_NUM}-00
-        apt-mark hold kubelet kubeadm kubectl
-    fi
-    
-    # 启用 kubelet
-    systemctl enable kubelet
-    
-    log_success "Kubernetes 组件安装完成"
-}
-
-# 初始化 Master 节点
-initialize_master() {
-    log_header "初始化 Master 节点"
-    
-    # 确保主机名解析正确
-    log_step "检查主机名解析"
-    if ! ping -c 1 "$CURRENT_HOSTNAME" >/dev/null 2>&1; then
-        log_warning "主机名解析失败，添加到 /etc/hosts"
-        if ! grep -q "$CURRENT_HOSTNAME" /etc/hosts; then
-            echo "$CURRENT_IP $CURRENT_HOSTNAME" >> /etc/hosts
-        fi
-    fi
-    
-    # 等待 kubelet 就绪
-    log_step "等待 kubelet 服务就绪"
-    systemctl restart kubelet
-    sleep 10
-    
-    log_step "预拉取镜像"
-    kubeadm config images pull --image-repository=registry.aliyuncs.com/google_containers --kubernetes-version=$K8S_VERSION
-    
-    log_step "初始化集群"
-    
-    # 创建 kubeadm 配置文件
-    cat > /tmp/kubeadm-config.yaml << EOF
-apiVersion: kubeadm.k8s.io/v1beta3
-kind: InitConfiguration
-localAPIEndpoint:
-  advertiseAddress: $CURRENT_IP
-  bindPort: 6443
-nodeRegistration:
-  name: $CURRENT_HOSTNAME
-  criSocket: unix:///var/run/containerd/containerd.sock
----
-apiVersion: kubeadm.k8s.io/v1beta3
-kind: ClusterConfiguration
-kubernetesVersion: $K8S_VERSION
-imageRepository: registry.aliyuncs.com/google_containers
-clusterName: kubernetes
-networking:
-  podSubnet: $POD_CIDR
-  serviceSubnet: $SERVICE_CIDR
-apiServer:
-  advertiseAddress: $CURRENT_IP
-controllerManager: {}
-scheduler: {}
-etcd:
-  local:
-    dataDir: /var/lib/etcd
----
-apiVersion: kubelet.config.k8s.io/v1beta1
-kind: KubeletConfiguration
-cgroupDriver: systemd
-containerRuntimeEndpoint: unix:///var/run/containerd/containerd.sock
-EOF
-    
-    # 使用配置文件初始化
-    kubeadm init --config=/tmp/kubeadm-config.yaml --ignore-preflight-errors=NumCPU,Mem
-    
-    if [ $? -eq 0 ]; then
-        log_success "集群初始化成功"
-    else
-        log_error "集群初始化失败"
-        log_info "尝试使用更详细的错误信息重新初始化..."
-        
-        # 如果失败，尝试基本命令
-        kubeadm init \
-            --apiserver-advertise-address="$CURRENT_IP" \
-            --kubernetes-version="$K8S_VERSION" \
-            --pod-network-cidr="$POD_CIDR" \
-            --service-cidr="$SERVICE_CIDR" \
-            --image-repository=registry.aliyuncs.com/google_containers \
-            --node-name="$CURRENT_HOSTNAME" \
-            --cri-socket=unix:///var/run/containerd/containerd.sock \
-            --ignore-preflight-errors=NumCPU,Mem \
-            --v=5
-        
-        if [ $? -ne 0 ]; then
-            log_error "集群初始化最终失败"
-            exit 1
-        fi
-    fi
-    
-    # 清理临时文件
-    rm -f /tmp/kubeadm-config.yaml
-    
-    # 配置 kubectl
-    log_step "配置 kubectl"
-    mkdir -p $HOME/.kube
-    cp -i /etc/kubernetes/admin.conf $HOME/.kube/config
-    chown $(id -u):$(id -g) $HOME/.kube/config
-    
-    # 生成加入命令
-    log_step "生成 Worker 节点加入命令"
-    if JOIN_COMMAND=$(kubeadm token create --print-join-command 2>/dev/null); then
-        echo "$JOIN_COMMAND" > /tmp/k8s-join-command.txt
-        log_success "加入命令已生成并保存到 /tmp/k8s-join-command.txt"
-        
-        echo
-        echo "=============================================="
-        echo "         Worker 节点加入命令"
-        echo "=============================================="
-        echo "$JOIN_COMMAND"
-        echo "=============================================="
-        echo
-        log_info "请将上述命令复制到 Worker 节点执行，或使用脚本自动获取"
-    else
-        log_warning "自动生成加入命令失败，可手动生成："
-        echo "  kubeadm token create --print-join-command"
-    fi
-    
-    log_success "Master 节点初始化完成"
-    
-    # 如果是单节点集群，移除污点
-    if [ "$INSTALL_MODE" = "single" ]; then
-        log_step "配置单节点集群（移除污点）"
-        kubectl taint nodes --all node-role.kubernetes.io/control-plane-
-        kubectl taint nodes --all node-role.kubernetes.io/master- 2>/dev/null || true
-    fi
-}
-
-# 安装网络插件
-install_network_plugin() {
-    log_header "安装网络插件"
-    
-    echo "选择网络插件："
-    echo "1) Flannel (推荐，简单易用)"
-    echo "2) Calico (功能丰富)"
-    echo "3) 稍后手动安装"
-    echo
-    
-    read -p "请选择网络插件 (1-3): " network_choice
-    
-    case $network_choice in
-        1)
-            log_step "安装 Flannel 网络插件"
-            kubectl apply -f https://raw.githubusercontent.com/flannel-io/flannel/master/Documentation/kube-flannel.yml
-            log_success "Flannel 安装完成"
-            ;;
-        2)
-            log_step "安装 Calico 网络插件"
-            kubectl create -f https://raw.githubusercontent.com/projectcalico/calico/v3.26.1/manifests/tigera-operator.yaml
-            kubectl create -f https://raw.githubusercontent.com/projectcalico/calico/v3.26.1/manifests/custom-resources.yaml
-            log_success "Calico 安装完成"
-            ;;
-        3)
-            log_info "跳过网络插件安装"
-            log_warning "请手动安装网络插件，否则节点将保持 NotReady 状态"
-            ;;
-        *)
-            log_warning "无效选择，安装 Flannel"
-            kubectl apply -f https://raw.githubusercontent.com/flannel-io/flannel/master/Documentation/kube-flannel.yml
-            ;;
-    esac
-}
-
-# 加入 Worker 节点
-join_worker_node() {
-    log_header "加入 Worker 节点"
-    
-    echo "加入集群的方式："
-    echo "1) 从 Master 节点自动获取（推荐）"
-    echo "2) 手动输入加入命令 Master 节点：kubeadm token create --print-join-command"
-    echo "3) 从文件读取加入命令"
-    echo "4) 输入 Master 信息生成加入命令"
-    echo
-    
-    read -p "请选择方式 (1-3): " join_method
-    
-    case $join_method in
-        1)
-            read -p "请输入 Master 节点 IP: " master_ip
-            if [ -z "$master_ip" ]; then
-                log_error "Master IP 不能为空"
-                return 1
+            # 检查systemd服务状态
+            if [[ -f "/etc/systemd/system/${service_name}.service" ]]; then
+                echo ""
+                log_info "systemd服务状态："
+                systemctl status "$service_name" --no-pager -l
+                echo ""
             fi
             
-            log_info "连接到 Master 节点获取加入命令..."
-            if command -v ssh >/dev/null 2>&1; then
-                SMART_JOIN_COMMAND=$(ssh -o ConnectTimeout=10 -o StrictHostKeyChecking=no root@$master_ip "kubeadm token create --print-join-command" 2>/dev/null)
-                if [ $? -eq 0 ] && [ ! -z "$SMART_JOIN_COMMAND" ]; then
-                    log_success "成功获取加入命令"
-                    echo "命令: $SMART_JOIN_COMMAND"
-                    return 0
-                else
-                    log_error "自动获取失败，请在 Master 节点手动执行："
-                    echo "  kubeadm token create --print-join-command"
-                    echo "然后选择选项2手动输入"
-                    return 1
-                fi
-            else
-                log_error "未安装 SSH 客户端"
-                return 1
-            fi
-            ;;
-        2)
-            echo "请输入完整的加入命令："
-            echo "格式: kubeadm join <master-ip>:6443 --token <token> --discovery-token-ca-cert-hash sha256:<hash>"
-            read -p "加入命令: " join_command
-            ;;
-        3)
-            read -p "请输入包含加入命令的文件路径: " command_file
-            if [ -f "$command_file" ]; then
-                join_command=$(cat "$command_file")
-            else
-                log_error "文件不存在: $command_file"
-                exit 1
-            fi
-            ;;
-        4)
-            read -p "请输入 Master 节点 IP: " master_ip
-            read -p "请输入 Token: " token
-            read -p "请输入 CA 证书哈希 (sha256:xxx): " ca_hash
-            join_command="kubeadm join ${master_ip}:6443 --token ${token} --discovery-token-ca-cert-hash ${ca_hash} --node-name=${CURRENT_HOSTNAME}"
-            ;;
-        *)
-            log_error "无效选择"
-            exit 1
-            ;;
-    esac
-    
-    if [ -z "$join_command" ]; then
-        log_error "加入命令不能为空"
-        exit 1
-    fi
-    
-    log_step "执行加入命令"
-    eval "$join_command"
-    
-    if [ $? -eq 0 ]; then
-        log_success "节点成功加入集群"
-    else
-        log_error "节点加入失败"
-        exit 1
-    fi
-}
-
-# 配置 Worker 节点的 kubectl
-configure_worker_kubectl() {
-    log_header "配置 Worker 节点 kubectl"
-    
-    echo "kubectl 配置选项："
-    echo "1) 从 Master 节点复制配置"
-    echo "2) 创建只读访问配置"
-    echo "3) 跳过配置（推荐）"
-    echo
-    
-    read -p "请选择 (1-3): " kubectl_choice
-    
-    case $kubectl_choice in
-        1)
-            read -p "请输入 Master 节点 IP: " master_ip
-            log_step "从 Master 节点复制 kubectl 配置"
-            mkdir -p ~/.kube
-            scp root@${master_ip}:~/.kube/config ~/.kube/config 2>/dev/null || {
-                log_error "无法从 Master 节点复制配置"
-                log_info "请手动复制或在 Master 节点上使用 kubectl"
-            }
-            ;;
-        2)
-            log_step "创建只读访问配置"
-            # 这里可以实现创建只读权限的 kubeconfig
-            log_warning "只读配置功能待实现"
-            ;;
-        3)
-            log_info "跳过 kubectl 配置"
-            log_info "建议在 Master 节点上使用 kubectl 管理集群"
-            ;;
-    esac
-}
-
-# 验证安装
-verify_installation() {
-    log_header "验证安装"
-    
-    # 检查组件版本
-    log_step "检查组件版本"
-    if kubectl version --client >/dev/null 2>&1; then
-        kubectl version --client --output=yaml | grep gitVersion || echo "kubectl: $(kubectl version --client --short 2>/dev/null || echo '未正确配置')"
-    else
-        echo "kubectl: 未配置或无法连接到集群"
-    fi
-    
-    echo "kubeadm: $(kubeadm version --output=short 2>/dev/null || kubeadm version 2>/dev/null | grep 'kubeadm version' || echo '版本获取失败')"
-    echo "kubelet: $(kubelet --version 2>/dev/null || echo '版本获取失败')"
-    
-    if [ "$INSTALL_MODE" = "master" ] || [ "$INSTALL_MODE" = "single" ]; then
-        # 等待节点就绪
-        log_step "等待节点就绪（最多等待2分钟）"
-        for i in {1..24}; do
-            if kubectl get nodes 2>/dev/null | grep -q "Ready"; then
-                break
-            fi
-            echo -n "."
-            sleep 5
-        done
-        echo
-        
-        # 检查节点状态
-        log_step "检查节点状态"
-        kubectl get nodes -o wide 2>/dev/null || {
-            log_warning "kubectl 未正确配置，尝试修复..."
-            if [ -f /etc/kubernetes/admin.conf ]; then
-                mkdir -p $HOME/.kube
-                cp -i /etc/kubernetes/admin.conf $HOME/.kube/config
-                chown $(id -u):$(id -g) $HOME/.kube/config
-                log_info "kubectl 配置已修复，重新检查..."
-                kubectl get nodes -o wide
-            else
-                log_error "无法找到 admin.conf 文件"
-            fi
-        }
-        
-        # 检查系统 Pod
-        log_step "检查系统 Pod 状态"
-        kubectl get pods --all-namespaces 2>/dev/null || log_warning "无法获取 Pod 状态"
-        
-        # 等待所有 Pod 就绪
-        log_step "等待系统 Pod 就绪（最多等待3分钟）"
-        for i in {1..36}; do
-            pending_pods=$(kubectl get pods --all-namespaces --no-headers 2>/dev/null | grep -E "(Pending|ContainerCreating|Init)" | wc -l)
-            if [ "$pending_pods" -eq 0 ]; then
-                log_success "所有系统 Pod 已就绪"
-                break
-            fi
-            echo "等待 $pending_pods 个 Pod 启动... ($i/36)"
-            sleep 5
-        done
-        
-        # 创建测试 Pod
-        log_step "创建测试 Pod 验证集群功能"
-        if kubectl run test-pod --image=nginx:alpine --restart=Never --dry-run=client -o yaml | kubectl apply -f - 2>/dev/null; then
-            log_info "等待测试 Pod 启动..."
-            sleep 15
-            
-            pod_status=$(kubectl get pod test-pod -o jsonpath='{.status.phase}' 2>/dev/null || echo "Unknown")
-            if [ "$pod_status" = "Running" ]; then
-                log_success "测试 Pod 运行正常"
-                kubectl get pod test-pod -o wide
-            else
-                log_warning "测试 Pod 状态: $pod_status"
-                kubectl describe pod test-pod 2>/dev/null || true
-            fi
-            
-            # 清理测试 Pod
-            kubectl delete pod test-pod 2>/dev/null || true
-        else
-            log_warning "无法创建测试 Pod，跳过测试"
+            return 0
         fi
         
-        log_success "验证完成"
-        
-        # 显示加入命令
-        if [ -f /tmp/k8s-join-command.txt ]; then
-            echo
-            log_info "Worker 节点加入命令："
-            echo "=============================================="
-            cat /tmp/k8s-join-command.txt
-            echo "=============================================="
-        else
-            echo
-            log_info "生成 Worker 节点加入命令："
-            join_cmd=$(kubeadm token create --print-join-command 2>/dev/null || echo "命令生成失败")
-            echo "=============================================="
-            echo "$join_cmd"
-            echo "=============================================="
-            echo "$join_cmd" > /tmp/k8s-join-command.txt
-        fi
-    else
-        log_step "Worker 节点验证"
-        log_info "请在 Master 节点上运行 'kubectl get nodes' 验证节点加入"
-        
-        # 检查 kubelet 状态
-        if systemctl is-active kubelet >/dev/null 2>&1; then
-            log_success "kubelet 服务运行正常"
-        else
-            log_warning "kubelet 服务状态异常"
-            systemctl status kubelet --no-pager
-        fi
-    fi
-}
-
-# 显示安装后信息
-show_post_install_info() {
-    log_header "安装完成"
-    
-    echo "安装信息总结："
-    echo "  节点类型: $INSTALL_MODE"
-    echo "  主机名: $CURRENT_HOSTNAME"
-    echo "  IP 地址: $CURRENT_IP"
-    echo "  Kubernetes 版本: $K8S_VERSION"
-    echo "  操作系统: $OS $OS_VERSION"
-    
-    if [ "$INSTALL_MODE" = "master" ] || [ "$INSTALL_MODE" = "single" ]; then
-        echo "  Pod CIDR: $POD_CIDR"
-        echo "  Service CIDR: $SERVICE_CIDR"
-    fi
-    
-    echo
-    echo "常用命令："
-    echo "  查看节点: kubectl get nodes"
-    echo "  查看 Pod: kubectl get pods --all-namespaces"
-    echo "  查看服务: kubectl get svc --all-namespaces"
-    echo "  集群信息: kubectl cluster-info"
-    
-    if [ "$INSTALL_MODE" = "master" ] || [ "$INSTALL_MODE" = "single" ]; then
-        echo "  生成加入命令: kubeadm token create --print-join-command"
-    fi
-    
-    echo
-    echo "配置文件位置："
-    echo "  kubectl 配置: ~/.kube/config"
-    echo "  kubelet 配置: /var/lib/kubelet/config.yaml"
-    echo "  containerd 配置: /etc/containerd/config.toml"
-    
-    if [ "$INSTALL_MODE" = "master" ] || [ "$INSTALL_MODE" = "single" ]; then
-        echo "  集群配置: /etc/kubernetes/"
-    fi
-    
-    echo
-    echo "故障排查："
-    echo "  查看 kubelet 日志: journalctl -u kubelet -f"
-    echo "  查看 containerd 日志: journalctl -u containerd -f"
-    echo "  检查节点状态: kubectl describe node $CURRENT_HOSTNAME"
-    
-    if [ "$INSTALL_MODE" = "worker" ]; then
-        echo
-        log_warning "Worker 节点不建议直接使用 kubectl"
-        log_info "请在 Master 节点上管理集群"
-    fi
-    
-    echo
-    log_success "Kubernetes 安装完成！感谢使用本脚本。"
-}
-
-# 错误处理和清理
-cleanup_on_error() {
-    log_error "安装过程中发生错误，正在清理..."
-    
-    # 停止服务
-    systemctl stop kubelet 2>/dev/null || true
-    systemctl stop containerd 2>/dev/null || true
-    systemctl stop docker 2>/dev/null || true
-    
-    # 清理 kubeadm
-    kubeadm reset -f 2>/dev/null || true
-    
-    log_info "清理完成，请检查错误信息并重新运行脚本"
-}
-
-# 主菜单
-show_main_menu() {
-    while true; do
-        show_banner
-        get_network_info
-        
-        echo "主菜单："
-        echo "1) 快速安装 Master 节点"
-        echo "2) 快速安装 Worker 节点"
-        echo "3) 自定义安装"
-        echo "4) 修复现有安装"
-        echo "5) 节点清理重新加入"
-        echo "6) 卸载 Kubernetes"
-        echo "0) 退出"
-        echo
-        
-        read -p "请选择操作 (0-6): " main_choice
-        
-        case $main_choice in
-            1)
-                quick_install_master
-                break
-                ;;
-            2)
-                quick_install_worker
-                break
-                ;;
-            3)
-                custom_install
-                break
-                ;;
-            4)
-                repair_installation
-                break
-                ;;
-            5)
-                cleanup_rejoin_workflow
-                break
-                ;;
-            6)
-                uninstall_kubernetes
-                break
-                ;;
-            0)
-                log_info "退出安装脚本"
-                exit 0
-                ;;
-            *)
-                log_error "无效选择，请重新选择"
-                sleep 2
-                ;;
-        esac
+        log_info "等待MySQL启动... ($((retry_count + 1))/$max_retries)"
+        sleep 2
+        ((retry_count++))
     done
+    
+    log_error "MySQL启动超时，开始故障排除"
+    troubleshoot_mysql_startup
+    exit 1
 }
 
-# 快速安装 Master 节点
-quick_install_master() {
-    log_header "快速安装 Master 节点"
+# MySQL启动故障排除函数
+troubleshoot_mysql_startup() {
+    log_step "MySQL启动故障排除"
     
-    INSTALL_MODE="master"
-    K8S_VERSION="$DEFAULT_K8S_VERSION"
-    POD_CIDR="$DEFAULT_POD_CIDR"
-    SERVICE_CIDR="$DEFAULT_SERVICE_CIDR"
+    local service_name="mysqld_${MYSQL_PORT}"
     
-    log_info "使用默认配置进行快速安装"
-    log_info "Kubernetes 版本: $K8S_VERSION"
-    log_info "Pod CIDR: $POD_CIDR"
+    echo ""
+    echo "=========================================="
+    echo -e "${RED}MySQL启动失败，开始故障排除${NC}"
+    echo "=========================================="
+    echo ""
     
-    read -p "是否继续？(y/N): " -n 1 -r
-    echo
-    if [[ ! $REPLY =~ ^[Yy]$ ]]; then
-        return
-    fi
-    
-    execute_installation
-}
-
-# 快速安装 Worker 节点
-quick_install_worker() {
-    log_header "快速安装 Worker 节点"
-    
-    INSTALL_MODE="worker"
-    K8S_VERSION="$DEFAULT_K8S_VERSION"
-    
-    log_info "使用默认配置进行快速安装"
-    log_info "Kubernetes 版本: $K8S_VERSION"
-    
-    read -p "是否继续？(y/N): " -n 1 -r
-    echo
-    if [[ ! $REPLY =~ ^[Yy]$ ]]; then
-        return
-    fi
-    
-    execute_installation
-}
-
-# 自定义安装
-custom_install() {
-    log_header "自定义安装"
-    
-    configure_hostname
-    select_install_mode
-    select_k8s_version
-    configure_network
-    
-    echo
-    log_info "配置确认："
-    echo "  主机名: $CURRENT_HOSTNAME"
-    echo "  安装模式: $INSTALL_MODE"
-    echo "  Kubernetes 版本: $K8S_VERSION"
-    if [ "$INSTALL_MODE" = "master" ] || [ "$INSTALL_MODE" = "single" ]; then
-        echo "  Pod CIDR: $POD_CIDR"
-        echo "  Service CIDR: $SERVICE_CIDR"
-    fi
-    
-    read -p "确认安装？(y/N): " -n 1 -r
-    echo
-    if [[ ! $REPLY =~ ^[Yy]$ ]]; then
-        return
-    fi
-    
-    execute_installation
-}
-
-# 执行安装
-execute_installation() {
-    # 设置错误处理
-    trap cleanup_on_error ERR
-    
-    check_system_requirements
-    configure_system_environment
-    install_container_runtime
-    
-    # 验证容器运行时
-    if ! verify_container_runtime; then
-        log_error "容器运行时验证失败"
-        exit 1
-    fi
-    
-    install_kubernetes_components
-    
-    case $INSTALL_MODE in
-        "master")
-            initialize_master
-            install_network_plugin
-            ;;
-        "worker")
-            # 检查容器运行时兼容性
-            check_mixed_runtime_compatibility
-            join_worker_node
-            configure_worker_kubectl
-            ;;
-        "single")
-            initialize_master
-            install_network_plugin
-            ;;
-        "components-only")
-            log_info "仅安装组件完成"
-            ;;
-    esac
-    
-    verify_installation
-    show_post_install_info
-    
-    # 取消错误处理
-    trap - ERR
-}
-
-# 修复现有安装
-repair_installation() {
-    log_header "修复现有安装"
-    
-    echo "常见问题修复："
-    echo "1) 节点 NotReady 状态"
-    echo "2) kubectl 连接问题"
-    echo "3) 容器运行时问题"
-    echo "4) 网络插件问题"
-    echo "5) 重置集群"
-    echo "0) 返回主菜单"
-    echo
-    
-    read -p "请选择要修复的问题 (0-5): " repair_choice
-    
-    case $repair_choice in
-        1)
-            repair_node_not_ready
-            ;;
-        2)
-            repair_kubectl_connection
-            ;;
-        3)
-            repair_container_runtime
-            ;;
-        4)
-            repair_network_plugin
-            ;;
-        5)
-            reset_cluster
-            ;;
-        0)
-            return
-            ;;
-        *)
-            log_error "无效选择"
-            ;;
-    esac
-}
-
-# 修复节点 NotReady
-repair_node_not_ready() {
-    log_step "修复节点 NotReady 状态"
-    
-    # 重启关键服务
-    systemctl restart containerd
-    systemctl restart kubelet
-    
-    log_info "等待节点恢复..."
-    sleep 30
-    
-    kubectl get nodes 2>/dev/null || log_warning "kubectl 未配置或无法连接"
-}
-
-# 修复 kubectl 连接
-repair_kubectl_connection() {
-    log_step "修复 kubectl 连接问题"
-    
-    if [ -f /etc/kubernetes/admin.conf ]; then
-        mkdir -p ~/.kube
-        cp /etc/kubernetes/admin.conf ~/.kube/config
-        chown $(id -u):$(id -g) ~/.kube/config
-        log_success "kubectl 配置已修复"
-    else
-        log_error "admin.conf 不存在，可能需要重新初始化集群"
-    fi
-}
-
-# 修复容器运行时
-repair_container_runtime() {
-    log_step "修复容器运行时问题"
-    
-    # 重新配置 containerd
-    mkdir -p /etc/containerd
-    containerd config default > /etc/containerd/config.toml
-    sed -i 's/SystemdCgroup = false/SystemdCgroup = true/' /etc/containerd/config.toml
-    sed -i '/disabled_plugins/s/\["cri"\]/[]/' /etc/containerd/config.toml
-    
-    systemctl restart containerd
-    systemctl restart kubelet
-    
-    log_success "容器运行时配置已修复"
-}
-
-# 修复网络插件
-repair_network_plugin() {
-    log_step "修复网络插件问题"
-    
-    # 重新安装 flannel
-    kubectl delete -f https://raw.githubusercontent.com/flannel-io/flannel/master/Documentation/kube-flannel.yml 2>/dev/null || true
-    sleep 10
-    kubectl apply -f https://raw.githubusercontent.com/flannel-io/flannel/master/Documentation/kube-flannel.yml
-    
-    log_success "网络插件已重新安装"
-}
-
-# 重置集群
-reset_cluster() {
-    log_warning "重置集群将删除所有数据"
-    read -p "确认重置集群？(y/N): " -n 1 -r
-    echo
-    if [[ ! $REPLY =~ ^[Yy]$ ]]; then
-        return
-    fi
-    
-    log_step "重置集群"
-    kubeadm reset -f
-    rm -rf /etc/kubernetes/
-    rm -rf ~/.kube/
-    rm -rf /var/lib/etcd/
-    
-    log_success "集群已重置"
-}
-
-# 卸载 Kubernetes
-uninstall_kubernetes() {
-    log_warning "卸载 Kubernetes 将删除所有组件和数据"
-    read -p "确认卸载？(y/N): " -n 1 -r
-    echo
-    if [[ ! $REPLY =~ ^[Yy]$ ]]; then
-        return
-    fi
-    
-    log_step "卸载 Kubernetes"
-    
-    # 重置集群
-    kubeadm reset -f 2>/dev/null || true
-    
-    # 停止服务
-    systemctl stop kubelet 2>/dev/null || true
-    systemctl disable kubelet 2>/dev/null || true
-    
-    # 卸载组件
-    if [ "$OS" = "centos" ]; then
-        yum remove -y kubelet kubeadm kubectl 2>/dev/null || true
-    else
-        apt-get remove -y kubelet kubeadm kubectl 2>/dev/null || true
-        apt-mark unhold kubelet kubeadm kubectl 2>/dev/null || true
-    fi
-    
-    # 清理配置文件
-    rm -rf /etc/kubernetes/
-    rm -rf ~/.kube/
-    rm -rf /var/lib/kubelet/
-    rm -rf /var/lib/etcd/
-    
-    # 清理 CNI 配置
-    rm -rf /etc/cni/
-    rm -rf /opt/cni/
-    
-    # 清理网络配置
-    log_step "清理网络配置"
-    iptables -F 2>/dev/null || true
-    iptables -t nat -F 2>/dev/null || true
-    iptables -t mangle -F 2>/dev/null || true
-    iptables -X 2>/dev/null || true
-    
-    # 清理 IPVS
-    ipvsadm --clear 2>/dev/null || true
-    
-    # 清理网络接口
-    ip link delete cni0 2>/dev/null || true
-    ip link delete flannel.1 2>/dev/null || true
-    ip link delete docker0 2>/dev/null || true
-    
-    # 清理容器运行时（可选）
-    echo
-    read -p "是否同时卸载容器运行时 (Docker/containerd)？(y/N): " -n 1 -r
-    echo
-    if [[ $REPLY =~ ^[Yy]$ ]]; then
-        log_step "卸载容器运行时"
+    # 1. 检查systemd服务状态
+    if [[ -f "/etc/systemd/system/${service_name}.service" ]]; then
+        echo "1. systemd服务状态 ($service_name)："
+        systemctl status "$service_name" --no-pager -l || true
+        echo ""
         
-        # 停止服务
-        systemctl stop docker 2>/dev/null || true
-        systemctl stop containerd 2>/dev/null || true
-        systemctl disable docker 2>/dev/null || true
-        systemctl disable containerd 2>/dev/null || true
-        
-        if [ "$OS" = "centos" ]; then
-            yum remove -y docker-ce docker-ce-cli containerd.io 2>/dev/null || true
+        echo "2. systemd日志 (最近50行)："
+        journalctl -u "$service_name" -n 50 --no-pager || true
+        echo ""
+    fi
+    
+    # 2. 检查MySQL错误日志
+    if [[ -f "$MYSQL_ERROR_LOG" ]]; then
+        echo "3. MySQL错误日志 (最后30行)："
+        echo "   文件位置: $MYSQL_ERROR_LOG"
+        tail -30 "$MYSQL_ERROR_LOG" 2>/dev/null || echo "   无法读取错误日志文件"
+        echo ""
+    else
+        echo "3. MySQL错误日志文件不存在: $MYSQL_ERROR_LOG"
+        echo ""
+    fi
+    
+    # 3. 检查PID文件
+    echo "4. PID文件检查："
+    if [[ -f "$MYSQL_PID_FILE" ]]; then
+        echo "   PID文件存在: $MYSQL_PID_FILE"
+        echo "   PID内容: $(cat "$MYSQL_PID_FILE" 2>/dev/null || echo '无法读取')"
+        local pid_content=$(cat "$MYSQL_PID_FILE" 2>/dev/null)
+        if [[ -n "$pid_content" ]] && kill -0 "$pid_content" 2>/dev/null; then
+            echo "   进程 $pid_content 仍在运行"
         else
-            apt-get remove -y docker-ce docker-ce-cli containerd.io 2>/dev/null || true
+            echo "   PID文件中的进程已不存在"
         fi
-        
-        # 清理 Docker 数据
-        rm -rf /var/lib/docker/
-        rm -rf /var/lib/containerd/
-        rm -rf /etc/docker/
-        rm -rf /etc/containerd/
-    fi
-    
-    # 重启网络服务
-    log_step "重启网络服务"
-    if [ "$OS" = "centos" ]; then
-        systemctl restart network 2>/dev/null || systemctl restart NetworkManager 2>/dev/null || true
     else
-        systemctl restart networking 2>/dev/null || systemctl restart NetworkManager 2>/dev/null || true
+        echo "   PID文件不存在: $MYSQL_PID_FILE"
     fi
+    echo ""
     
-    log_success "Kubernetes 卸载完成"
-    echo
-    log_info "清理内容："
-    echo "  ✓ Kubernetes 组件和配置"
-    echo "  ✓ etcd 数据"
-    echo "  ✓ CNI 网络配置"
-    echo "  ✓ iptables 规则"
-    echo "  ✓ 网络接口"
+    # 4. 检查端口占用
+    echo "5. 端口占用检查："
+    local port_check=$(netstat -tlnp 2>/dev/null | grep ":$MYSQL_PORT " || ss -tlnp 2>/dev/null | grep ":$MYSQL_PORT " || echo "端口未被占用")
+    echo "   端口 $MYSQL_PORT: $port_check"
+    echo ""
     
-    if [[ $REPLY =~ ^[Yy]$ ]]; then
-        echo "  ✓ 容器运行时"
+    # 5. 检查数据目录权限
+    echo "6. 数据目录权限检查："
+    echo "   数据目录: $MYSQL_DATA_DIR"
+    if [[ -d "$MYSQL_DATA_DIR" ]]; then
+        echo "   权限信息: $(ls -ld "$MYSQL_DATA_DIR")"
+        echo "   所有者: $(stat -c '%U:%G' "$MYSQL_DATA_DIR" 2>/dev/null || echo '无法获取')"
+    else
+        echo "   数据目录不存在！"
     fi
+    echo ""
     
-    echo
-    log_info "建议重启系统以确保完全清理"
+    # 6. 检查MySQL进程
+    echo "7. MySQL进程检查："
+    local mysql_processes=$(ps aux | grep -E '[m]ysql' || echo "未发现MySQL进程")
+    echo "$mysql_processes"
+    echo ""
+    
+    # 7. 检查磁盘空间
+    echo "8. 磁盘空间检查："
+    df -h "$MYSQL_DATA_DIR" 2>/dev/null || df -h /
+    echo ""
+    
+    # 8. 检查配置文件
+    echo "9. 配置文件检查："
+    if [[ -f "$MYSQL_CONFIG_FILE" ]]; then
+        echo "   配置文件存在: $MYSQL_CONFIG_FILE"
+        echo "   权限信息: $(ls -l "$MYSQL_CONFIG_FILE")"
+    else
+        echo "   配置文件不存在: $MYSQL_CONFIG_FILE"
+    fi
+    echo ""
+    
+    # 9. 提供解决建议
+    echo "=========================================="
+    echo -e "${YELLOW}常见解决方案${NC}"
+    echo "=========================================="
+    echo ""
+    echo "1. 检查错误日志中的具体错误信息："
+    echo "   tail -f $MYSQL_ERROR_LOG"
+    echo ""
+    echo "2. 确保数据目录权限正确："
+    echo "   chown -R mysql:mysql /data/${MYSQL_PORT}"
+    echo ""
+    echo "3. 如果是权限问题，重新初始化："
+    echo "   rm -rf $MYSQL_DATA_DIR/*"
+    echo "   $MYSQL_BASE_DIR/bin/mysqld --initialize-insecure --user=mysql --basedir=$MYSQL_BASE_DIR --datadir=$MYSQL_DATA_DIR"
+    echo ""
+    echo "4. 手动启动测试："
+    echo "   sudo -u mysql $MYSQL_BASE_DIR/bin/mysqld_safe --defaults-file=$MYSQL_CONFIG_FILE &"
+    echo ""
+    echo "5. 检查端口冲突："
+    echo "   netstat -tlnp | grep $MYSQL_PORT"
+    echo ""
+    echo "6. 查看完整的启动日志："
+    if [[ -f "/etc/systemd/system/${service_name}.service" ]]; then
+        echo "   journalctl -u $service_name -f"
+    else
+        echo "   tail -f $MYSQL_ERROR_LOG"
+    fi
+    echo ""
 }
 
-# 节点清理重新加入工作流
-cleanup_rejoin_workflow() {
-    log_header "节点清理重新加入"
+# 安全配置提醒
+security_reminder() {
+    log_step "安装完成 - 安全配置提醒"
     
-    # 检测当前状态
-    if detect_node_config_status; then
-        # 需要清理
-        echo
-        echo "处理选项："
-        echo "1) 自动清理并重新加入（推荐）"
-        echo "2) 仅执行清理"
-        echo "3) 仅重新加入集群"
-        echo "4) 返回主菜单"
-        echo
-        
-        read -p "请选择操作 (1-4): " action_choice
-        
-        case $action_choice in
-            1)
-                # 自动清理并重新加入
-                echo
-                echo "清理方式："
-                echo "1) 完整清理（推荐，清理所有配置和网络）"
-                echo "2) 快速清理（仅清理必要配置）"
-                echo
-                read -p "请选择清理方式 (1-2): " cleanup_choice
-                
-                case $cleanup_choice in
-                    1)
-                        deep_cleanup_node
-                        ;;
-                    2)
-                        quick_cleanup_node
-                        ;;
-                    *)
-                        log_warning "无效选择，使用快速清理"
-                        quick_cleanup_node
-                        ;;
-                esac
-                
-                # 获取加入命令并执行
-                if smart_get_join_command; then
-                    smart_join_cluster
-                else
-                    log_error "获取加入命令失败"
-                fi
-                ;;
-            2)
-                # 仅执行清理
-                echo
-                echo "清理方式："
-                echo "1) 完整清理"
-                echo "2) 快速清理"
-                read -p "请选择 (1-2): " cleanup_choice
-                
-                if [ "$cleanup_choice" = "1" ]; then
-                    deep_cleanup_node
-                else
-                    quick_cleanup_node
-                fi
-                ;;
-            3)
-                # 仅重新加入集群
-                if smart_get_join_command; then
-                    smart_join_cluster
-                fi
-                ;;
-            4)
-                return 0
-                ;;
-            *)
-                log_error "无效选择"
-                return 1
-                ;;
-        esac
+    echo ""
+    echo "=========================================="
+    echo -e "${GREEN}🎉 MySQL ${MYSQL_VERSION} 安装成功！${NC}"
+    echo "=========================================="
+    echo ""
+    echo -e "${YELLOW}📋 实例配置信息${NC}"
+    echo "----------------------------------------"
+    echo "• MySQL版本: $MYSQL_VERSION"
+    echo "• 端口号: $MYSQL_PORT"
+    echo "• 安装目录: $MYSQL_BASE_DIR"
+    echo "• 数据目录: $MYSQL_DATA_DIR"
+    echo "• 日志目录: $MYSQL_LOG_DIR"
+    echo "• 配置文件: $MYSQL_CONFIG_FILE"
+    echo "• Socket文件: $MYSQL_SOCKET"
+    echo "• PID文件: $MYSQL_PID_FILE"
+    echo "• 错误日志: $MYSQL_ERROR_LOG"
+    echo "• 慢查询日志: $MYSQL_SLOW_LOG"
+    
+    if [[ "$MYSQL_PORT" == "3306" ]]; then
+        echo ""
+        echo -e "${GREEN}✨ 标准实例配置 (端口3306)${NC}"
     else
-        # 无需清理，直接加入
-        log_info "节点状态干净，可以直接加入集群"
-        echo
-        read -p "是否立即加入集群？(y/N): " -n 1 -r
-        echo
-        if [[ $REPLY =~ ^[Yy]$ ]]; then
-            if smart_get_join_command; then
-                smart_join_cluster
-            fi
-        fi
+        echo ""
+        echo -e "${BLUE}🔧 独立实例配置 (端口${MYSQL_PORT})${NC}"
+        echo "• 配置目录: $MYSQL_CONFIG_DIR"
     fi
-}
-
-# 检测节点配置状态
-detect_node_config_status() {
-    log_header "检测节点配置状态"
     
-    echo "检查项目                          状态"
-    echo "=============================================="
+    echo ""
+    echo -e "${RED}🔐 安全提醒（重要！）${NC}"
+    echo "----------------------------------------"
+    echo "1. root用户当前密码为空，请立即设置密码："
+    echo "   mysql -u root -S $MYSQL_SOCKET"
+    echo "   ALTER USER 'root'@'localhost' IDENTIFIED BY '你的强密码';"
+    echo "   FLUSH PRIVILEGES;"
+    echo ""
+    echo "2. 建议运行MySQL安全配置向导："
+    echo "   mysql_secure_installation --socket=$MYSQL_SOCKET"
+    echo ""
     
-    # 检查配置文件
-    if [ -f /etc/kubernetes/kubelet.conf ]; then
-        echo "kubelet.conf                      存在 ❌"
-        HAS_KUBELET_CONF=true
+    # 服务管理命令
+    echo "3. MySQL服务管理命令："
+    local service_name="mysqld_${MYSQL_PORT}"
+    if [[ -f "/etc/systemd/system/${service_name}.service" ]] && systemctl is-enabled "$service_name" &>/dev/null; then
+        echo -e "   ${GREEN}(推荐使用systemd方式)${NC}"
+        echo "   启动: systemctl start $service_name"
+        echo "   停止: systemctl stop $service_name"
+        echo "   重启: systemctl restart $service_name"
+        echo "   状态: systemctl status $service_name"
+        echo "   查看日志: journalctl -u $service_name -f"
+        echo ""
+        echo "   传统方式仍然可用:"
+        echo "   启动: /etc/init.d/mysqld start"
+        echo "   停止: /etc/init.d/mysqld stop"
+        echo "   重启: /etc/init.d/mysqld restart"
     else
-        echo "kubelet.conf                      不存在 ✅"
-        HAS_KUBELET_CONF=false
+        echo -e "   ${YELLOW}(使用传统init.d方式)${NC}"
+        echo "   启动: /etc/init.d/mysqld start 或 service mysqld start"
+        echo "   停止: /etc/init.d/mysqld stop 或 service mysqld stop"
+        echo "   重启: /etc/init.d/mysqld restart 或 service mysqld restart"
     fi
     
-    if [ -f /etc/kubernetes/bootstrap-kubelet.conf ]; then
-        echo "bootstrap-kubelet.conf            存在 ❌"
-        HAS_BOOTSTRAP_CONF=true
-    else
-        echo "bootstrap-kubelet.conf            不存在 ✅"
-        HAS_BOOTSTRAP_CONF=false
+    echo ""
+    echo -e "${BLUE}🔧 故障排除${NC}"
+    echo "----------------------------------------"
+    echo "如果MySQL启动失败，可以："
+    echo "1. 检查错误日志: tail -f $MYSQL_ERROR_LOG"
+    if [[ -f "/etc/systemd/system/${service_name}.service" ]]; then
+        echo "2. 查看systemd日志: journalctl -u $service_name -f"
     fi
+    echo "3. 检查端口占用: netstat -tlnp | grep $MYSQL_PORT"
+    echo "4. 验证目录权限: ls -la /data/${MYSQL_PORT}"
+    echo "5. 手动启动测试: sudo -u mysql $MYSQL_BASE_DIR/bin/mysqld_safe --defaults-file=$MYSQL_CONFIG_FILE &"
+    echo ""
+    echo -e "${GREEN}✅ 测试连接${NC}"
+    echo "----------------------------------------"
+    echo "测试MySQL连接："
+    echo "  Socket连接: mysql -u root -S $MYSQL_SOCKET"
+    echo "  TCP连接: mysql -u root -h 127.0.0.1 -P $MYSQL_PORT"
+    echo "  检查版本: mysql -u root -S $MYSQL_SOCKET -e 'SELECT VERSION();'"
+    echo "  查看数据库: mysql -u root -S $MYSQL_SOCKET -e 'SHOW DATABASES;'"
+    echo ""
     
-    if [ -f /etc/kubernetes/pki/ca.crt ]; then
-        echo "ca.crt                           存在 ❌"
-        HAS_CA_CERT=true
-    else
-        echo "ca.crt                           不存在 ✅"
-        HAS_CA_CERT=false
-    fi
-    
-    # 检查服务状态
-    if systemctl is-active kubelet >/dev/null 2>&1; then
-        echo "kubelet 服务                      运行中 ⚠️"
-        KUBELET_RUNNING=true
-    else
-        echo "kubelet 服务                      已停止 ✅"
-        KUBELET_RUNNING=false
-    fi
-    
-    # 检查端口占用
-    if netstat -tlnp 2>/dev/null | grep -q ":10250"; then
-        echo "端口 10250                       被占用 ❌"
-        PORT_OCCUPIED=true
-    else
-        echo "端口 10250                       空闲 ✅"
-        PORT_OCCUPIED=false
-    fi
-    
-    # 检查容器运行时
-    if systemctl is-active docker >/dev/null 2>&1; then
-        echo "Docker 服务                      运行中 ✅"
-        CONTAINER_RUNTIME="docker"
-    elif systemctl is-active containerd >/dev/null 2>&1; then
-        echo "containerd 服务                  运行中 ✅"
-        CONTAINER_RUNTIME="containerd"
-    else
-        echo "容器运行时                        未运行 ❌"
-        CONTAINER_RUNTIME="none"
-    fi
-    
-    # 检查网络接口
-    if ip link show cni0 >/dev/null 2>&1; then
-        echo "CNI 网络接口                     存在 ❌"
-        HAS_CNI_INTERFACE=true
-    else
-        echo "CNI 网络接口                     不存在 ✅"
-        HAS_CNI_INTERFACE=false
-    fi
-    
-    echo "=============================================="
-    
-    # 判断是否需要清理
-    if [ "$HAS_KUBELET_CONF" = true ] || [ "$HAS_BOOTSTRAP_CONF" = true ] || 
-       [ "$HAS_CA_CERT" = true ] || [ "$PORT_OCCUPIED" = true ] ||
-       [ "$HAS_CNI_INTERFACE" = true ]; then
-        NEEDS_CLEANUP=true
-        echo
-        log_warning "检测到需要清理的配置"
-        return 0
-    else
-        NEEDS_CLEANUP=false
-        echo
-        log_success "节点状态干净，可以直接加入集群"
-        return 1
-    fi
-}
-
-# 完整清理节点配置
-deep_cleanup_node() {
-    log_step "执行完整节点清理"
-    
-    # 1. 停止相关服务
-    log_info "停止相关服务..."
-    systemctl stop kubelet 2>/dev/null || true
-    
-    # 2. 重置 kubeadm
-    log_info "重置 kubeadm..."
-    kubeadm reset -f 2>/dev/null || true
-    
-    # 3. 清理配置文件
-    log_info "清理 Kubernetes 配置文件..."
-    rm -rf /etc/kubernetes/
-    rm -rf ~/.kube/
-    rm -rf /var/lib/kubelet/
-    rm -rf /var/lib/etcd/
-    
-    # 4. 清理 CNI 网络配置
-    log_info "清理 CNI 网络配置..."
-    rm -rf /etc/cni/net.d/
-    rm -rf /opt/cni/bin/
-    
-    # 5. 清理网络接口
-    log_info "清理网络接口..."
-    ip link delete cni0 2>/dev/null || true
-    ip link delete flannel.1 2>/dev/null || true
-    ip link delete kube-bridge 2>/dev/null || true
-    ip link delete docker0 2>/dev/null || true
-    
-    # 6. 清理 iptables 规则
-    log_info "清理 iptables 规则..."
-    iptables -F 2>/dev/null || true
-    iptables -t nat -F 2>/dev/null || true
-    iptables -t mangle -F 2>/dev/null || true
-    iptables -X 2>/dev/null || true
-    
-    # 7. 清理 IPVS 规则
-    log_info "清理 IPVS 规则..."
-    ipvsadm --clear 2>/dev/null || true
-    
-    # 8. 询问是否清理容器和镜像
-    echo
-    read -p "是否清理容器和镜像？(y/N): " -n 1 -r
-    echo
-    if [[ $REPLY =~ ^[Yy]$ ]]; then
-        log_info "清理容器和镜像..."
-        if [ "$CONTAINER_RUNTIME" = "docker" ]; then
-            docker system prune -af 2>/dev/null || true
-        elif [ "$CONTAINER_RUNTIME" = "containerd" ]; then
-            crictl rmi --prune 2>/dev/null || true
-            crictl rm -af 2>/dev/null || true
-        fi
-    fi
-    
-    # 9. 重启容器运行时和 kubelet
-    log_info "重启服务..."
-    if [ "$CONTAINER_RUNTIME" = "docker" ]; then
-        systemctl restart docker
-    elif [ "$CONTAINER_RUNTIME" = "containerd" ]; then
-        systemctl restart containerd
-    else
-        log_error "容器运行时未运行，请先启动容器运行时"
-        return 1
-    fi
-    
-    systemctl restart kubelet
-    sleep 5
-    
-    log_success "完整清理完成"
-}
-
-# 快速清理节点配置
-quick_cleanup_node() {
-    log_step "执行快速节点清理"
-    
-    # 停止服务
-    systemctl stop kubelet 2>/dev/null || true
-    
-    # 重置 kubeadm
-    kubeadm reset -f 2>/dev/null || true
-    
-    # 清理主要配置文件
-    rm -rf /etc/kubernetes/
-    rm -rf ~/.kube/
-    rm -rf /var/lib/kubelet/
-    
-    # 重启服务
-    if [ "$CONTAINER_RUNTIME" = "docker" ]; then
-        systemctl restart docker
-    elif [ "$CONTAINER_RUNTIME" = "containerd" ]; then
-        systemctl restart containerd
-    fi
-    
-    systemctl restart kubelet
-    sleep 3
-    
-    log_success "快速清理完成"
-}
-
-# 自动获取加入命令
-smart_get_join_command() {
-    log_step "获取集群加入命令"
-    
-    echo "获取加入命令的方式："
-    echo "1) 从 Master 节点自动获取（推荐）"
-    echo "2) 手动输入完整加入命令"
-    echo "3) 从文件读取"
-    echo "4) 手动组装加入命令"
-    echo
-    
-    read -p "请选择方式 (1-4): " method_choice
-    
-    case $method_choice in
-        1)
-            read -p "请输入 Master 节点 IP: " master_ip
-            if [ -z "$master_ip" ]; then
-                log_error "Master IP 不能为空"
-                return 1
-            fi
-            
-            log_info "连接到 Master 节点获取加入命令..."
-            if command -v ssh >/dev/null 2>&1; then
-                SMART_JOIN_COMMAND=$(ssh -o ConnectTimeout=10 -o StrictHostKeyChecking=no root@$master_ip "kubeadm token create --print-join-command" 2>/dev/null)
-                if [ $? -eq 0 ] && [ ! -z "$SMART_JOIN_COMMAND" ]; then
-                    log_success "成功获取加入命令"
-                    echo "命令: $SMART_JOIN_COMMAND"
-                    return 0
-                else
-                    log_error "自动获取失败，请在 Master 节点手动执行："
-                    echo "  kubeadm token create --print-join-command"
-                    echo "然后选择选项2手动输入"
-                    return 1
-                fi
-            else
-                log_error "未安装 SSH 客户端"
-                return 1
-            fi
-            ;;
-        2)
-            echo
-            echo "请输入完整的加入命令："
-            echo "格式: kubeadm join <master-ip>:6443 --token <token> --discovery-token-ca-cert-hash sha256:<hash>"
-            echo
-            read -p "加入命令: " SMART_JOIN_COMMAND
-            ;;
-        3)
-            read -p "请输入包含加入命令的文件路径: " command_file
-            if [ -f "$command_file" ]; then
-                SMART_JOIN_COMMAND=$(cat "$command_file")
-                log_info "从文件读取: $SMART_JOIN_COMMAND"
-            else
-                log_error "文件不存在: $command_file"
-                return 1
-            fi
-            ;;
-        4)
-            echo
-            read -p "Master 节点 IP: " master_ip
-            read -p "Token: " token
-            read -p "CA 证书哈希 (sha256:xxx): " ca_hash
-            SMART_JOIN_COMMAND="kubeadm join ${master_ip}:6443 --token ${token} --discovery-token-ca-cert-hash ${ca_hash} --node-name=${CURRENT_HOSTNAME}"
-            ;;
-        *)
-            log_error "无效选择"
-            return 1
-            ;;
-    esac
-    
-    if [ -z "$SMART_JOIN_COMMAND" ]; then
-        log_error "加入命令不能为空"
-        return 1
-    fi
-    
-    return 0
-}
-
-# 执行智能加入集群
-smart_join_cluster() {
-    log_step "加入 Kubernetes 集群"
-    
-    echo "执行加入命令:"
-    echo "$SMART_JOIN_COMMAND"
-    echo
-    
-    if eval "$SMART_JOIN_COMMAND"; then
-        log_success "节点成功加入集群！"
-        
-        # 验证加入结果
-        log_step "验证节点加入状态"
-        
-        # 等待 kubelet 启动
-        log_info "等待 kubelet 服务启动..."
-        sleep 15
-        
-        # 检查 kubelet 状态
-        if systemctl is-active kubelet >/dev/null 2>&1; then
-            log_success "kubelet 服务运行正常"
-        else
-            log_warning "kubelet 服务可能需要更长时间启动"
-        fi
-        
-        echo
-        log_info "请在 Master 节点运行以下命令验证："
-        echo "  kubectl get nodes"
-        echo "  kubectl get nodes -o wide"
-        echo
-        log_info "节点应该在几分钟内变为 Ready 状态"
-        
-        return 0
-    else
-        log_error "节点加入失败"
-        return 1
-    fi
+    # 多实例快速部署指南
+    echo "=========================================="
+    echo -e "${BLUE}🚀 多实例快速部署指南${NC}"
+    echo "=========================================="
+    echo ""
+    echo "安装其他端口实例："
+    echo "  $0 3307    # 安装3307端口实例"
+    echo "  $0 3308    # 安装3308端口实例"
+    echo ""
+    echo "不同实例的目录结构："
+    echo "  端口3306: /etc/my.cnf (传统配置)"
+    echo "  端口3307: /data/3307/{data,conf,log}"
+    echo "  端口3308: /data/3308/{data,conf,log}"
+    echo ""
+    echo "多实例管理："
+    echo "  systemctl start mysqld_3306    # 启动3306"
+    echo "  systemctl start mysqld_3307    # 启动3307"
+    echo "  mysql -S /tmp/mysql.sock        # 连接3306"
+    echo "  mysql -S /tmp/mysql_3307.sock   # 连接3307"
+    echo ""
+    echo "=========================================="
+    echo -e "${GREEN}安装完成！祝您使用愉快！${NC}"
+    echo "=========================================="
 }
 
 # 主函数
 main() {
-    # 检查是否为 root 用户
-    if [ "$EUID" -ne 0 ]; then
-        log_error "请使用 root 用户运行此脚本"
-        echo "使用方法: sudo $0"
-        exit 1
-    fi
+    # 初始化配置变量
+    init_config "$1"
     
-    # 检查网络连接
-    if ! ping -c 1 8.8.8.8 >/dev/null 2>&1; then
-        log_warning "网络连接可能有问题，某些功能可能无法正常使用"
-    fi
+    log_info "开始MySQL ${MYSQL_VERSION} 自动安装 (端口: $MYSQL_PORT)"
     
-    # 显示主菜单
-    show_main_menu
+    # 显示配置并确认
+    show_config
+    
+    check_root
+    check_system
+    prepare_environment
+    create_mysql_user
+    download_and_install_mysql
+    setup_mysql_config
+    initialize_mysql
+    
+    log_info "数据库初始化完成，继续配置服务..."
+    
+    setup_mysql_service
+    setup_systemd_service
+    start_mysql
+    security_reminder
+    
+    log_info "MySQL ${MYSQL_VERSION} 安装完成！"
 }
 
 # 脚本入口
 if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+    # 显示脚本信息
+    echo ""
+    echo "=========================================="
+    echo -e "${GREEN}MySQL ${MYSQL_VERSION:-8.0.32} 多实例安装脚本${NC}"
+    echo "=========================================="
+    echo "使用方法: $0 [端口号]"
+    echo "默认端口: 3306"
+    echo ""
+    echo "示例:"
+    echo "  $0         # 安装3306端口实例"
+    echo "  $0 3306    # 安装3306端口实例" 
+    echo "  $0 3307    # 安装3307端口实例"
+    echo "  $0 3308    # 安装3308端口实例"
+    echo "=========================================="
+    echo ""
+    
     main "$@"
 fi
